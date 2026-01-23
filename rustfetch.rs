@@ -1,165 +1,130 @@
 use std::fs;
-use std::io::{self, BufRead};
 use std::process::Command;
 
 // ==== CONFIGURATION ====
 const ENABLE_GPU_DETECTION: bool = true;
 const USE_COLOR_OUTPUT: bool = true;
-const SHOW_SHELL: bool = true;
-const SHOW_KERNEL: bool = true;
 
-// ANSI color codes
-mod colors {
-    pub const RESET: &str = "\x1b[0m";
-    pub const BOLD_BLUE: &str = "\x1b[1;34m";
-    pub const BOLD_GREEN: &str = "\x1b[1;32m";
-    pub const BOLD_RED: &str = "\x1b[1;31m";
-    pub const BOLD_YELLOW: &str = "\x1b[1;33m";
+// ==== COLOR CODES ====
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const CYAN: &str = "\x1b[96m";
+const GREEN: &str = "\x1b[92m";
+const YELLOW: &str = "\x1b[93m";
+const BLUE: &str = "\x1b[94m";
+const MAGENTA: &str = "\x1b[95m";
+
+fn main() {
+    let hostname = get_hostname();
+    let os_name = get_os_name();
+    let kernel = get_kernel();
+    let uptime = get_uptime();
+    let shell = get_shell();
+    let cpu = get_cpu();
+    let memory = get_memory();
+    let gpus = if ENABLE_GPU_DETECTION {
+        get_all_gpus()
+    } else {
+        vec!["GPU detection disabled".to_string()]
+    };
+
+    let logo = get_os_logo(&os_name);
+    let info = format_info(&hostname, &os_name, &kernel, &uptime, &shell, &cpu, &memory, &gpus);
+
+    display_side_by_side(&logo, &info);
 }
 
-fn color_text(text: &str, color_code: &str) -> String {
+fn colorize(text: &str, color: &str) -> String {
     if USE_COLOR_OUTPUT {
-        format!("{}{}{}", color_code, text, colors::RESET)
+        format!("{}{}{}", color, text, RESET)
     } else {
         text.to_string()
     }
 }
 
-fn get_os_icon(os: &str) -> &str {
-    match os.to_lowercase().as_str() {
-        s if s.contains("macos") || s.contains("mac os") => "",
-        s if s.contains("ubuntu") => "♕",
-        s if s.contains("debian") => "♦",
-        s if s.contains("fedora") => "🦋",
-        s if s.contains("arch") => "🌀",
-        s if s.contains("pop") => "🚀",
-        s if s.contains("cachy") => "🌰",
-        s if s.contains("pika") => "🐭",
-        s if s.contains("elementary") => "🍎",
-        s if s.contains("manjaro") => "🌄",
-        s if s.contains("kali") => "🔪",
-        s if s.contains("suse") => "🦎",
-        s if s.contains("centos") => "🩸",
-        s if s.contains("rocky") => "🪨",
-        s if s.contains("alpine") => "🏔️",
-        s if s.contains("mint") => "🌿",
-        s if s.contains("linux") => "🐧",
-        _ => "",
-    }
-}
-
-fn main() {
-    println!("\n{}\n", color_text("=== rustfetch ===", colors::BOLD_BLUE));
-
-    display_info("Hostname", &get_hostname());
-    
-    let os_info = get_os_info();
-    let os_icon = get_os_icon(&os_info);
-    println!(
-        "{}: {} {}",
-        color_text("OS", colors::BOLD_GREEN),
-        os_icon,
-        os_info
-    );
-
-    if SHOW_KERNEL {
-        display_info("Kernel", &get_kernel_version());
-    }
-
-    if SHOW_SHELL {
-        display_info("Shell", &get_shell());
-    }
-
-    let (cpu_model, cores, threads) = get_cpu_info();
-    display_info("CPU", &cpu_model);
-    println!(
-        "{}: {} cores / {} threads",
-        color_text("Cores/Threads", colors::BOLD_GREEN),
-        cores,
-        threads
-    );
-
-    display_info("Memory", &get_memory_info());
-    display_info("Uptime", &get_uptime());
-
-    if ENABLE_GPU_DETECTION {
-        display_info("GPU", &get_gpu_info());
-    }
-
-    println!();
-}
-
-fn display_info(label: &str, value: &str) {
-    println!("{}: {}", color_text(label, colors::BOLD_GREEN), value);
-}
-
 fn get_hostname() -> String {
     fs::read_to_string("/etc/hostname")
-        .map(|s| s.trim().to_string())
-        .or_else(|_| {
+        .unwrap_or_else(|_| {
             Command::new("hostname")
                 .output()
-                .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .unwrap_or_else(|| "unknown".to_string())
         })
-        .unwrap_or_else(|_| "Unknown".to_string())
+        .trim()
+        .to_string()
 }
 
-fn get_os_info() -> String {
+fn get_os_name() -> String {
+    if let Ok(contents) = fs::read_to_string("/etc/os-release") {
+        for line in contents.lines() {
+            if line.starts_with("PRETTY_NAME=") {
+                return line
+                    .split('=')
+                    .nth(1)
+                    .unwrap_or("Unknown Linux")
+                    .trim_matches('"')
+                    .to_string();
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     {
-        Command::new("sw_vers")
-            .arg("-productVersion")
-            .output()
-            .ok()
-            .and_then(|out| {
-                let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                Some(format!("macOS {}", version))
-            })
-            .unwrap_or_else(|| "macOS".to_string())
+        if let Ok(output) = Command::new("sw_vers").arg("-productVersion").output() {
+            if let Ok(version) = String::from_utf8(output.stdout) {
+                return format!("macOS {}", version.trim());
+            }
+        }
+        return "macOS".to_string();
     }
 
-    #[cfg(target_os = "linux")]
-    {
-        fs::File::open("/etc/os-release")
-            .ok()
-            .and_then(|file| {
-                io::BufReader::new(file)
-                    .lines()
-                    .find_map(|line| {
-                        line.ok().and_then(|l| {
-                            if l.starts_with("PRETTY_NAME=") {
-                                Some(l.trim_start_matches("PRETTY_NAME=").trim_matches('"').to_string())
-                            } else {
-                                None
-                            }
-                        })
-                    })
-            })
-            .unwrap_or_else(|| "Linux".to_string())
-    }
+    #[cfg(target_os = "freebsd")]
+    return "FreeBSD".to_string();
 
-    #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-    {
-        Command::new("uname")
-            .args(&["-sr"])
-            .output()
-            .ok()
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .unwrap_or_else(|| "BSD".to_string())
-    }
+    #[cfg(target_os = "openbsd")]
+    return "OpenBSD".to_string();
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))]
-    {
-        "Unknown OS".to_string()
-    }
+    #[cfg(target_os = "netbsd")]
+    return "NetBSD".to_string();
+
+    "Unknown OS".to_string()
 }
 
-fn get_kernel_version() -> String {
+fn get_kernel() -> String {
     Command::new("uname")
         .arg("-r")
         .output()
         .ok()
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn get_uptime() -> String {
+    if let Ok(contents) = fs::read_to_string("/proc/uptime") {
+        if let Some(uptime_str) = contents.split_whitespace().next() {
+            if let Ok(uptime_secs) = uptime_str.parse::<f64>() {
+                let days = (uptime_secs / 86400.0) as u64;
+                let hours = ((uptime_secs % 86400.0) / 3600.0) as u64;
+                let mins = ((uptime_secs % 3600.0) / 60.0) as u64;
+
+                if days > 0 {
+                    return format!("{}d {}h {}m", days, hours, mins);
+                } else if hours > 0 {
+                    return format!("{}h {}m", hours, mins);
+                } else {
+                    return format!("{}m", mins);
+                }
+            }
+        }
+    }
+
+    Command::new("uptime")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "Unknown".to_string())
 }
 
@@ -167,233 +132,309 @@ fn get_shell() -> String {
     std::env::var("SHELL")
         .ok()
         .and_then(|s| s.split('/').last().map(String::from))
-        .unwrap_or_else(|| "Unknown".to_string())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn get_cpu_info() -> (String, usize, usize) {
-    #[cfg(target_os = "macos")]
-    {
-        let model = Command::new("sysctl")
-            .args(&["-n", "machdep.cpu.brand_string"])
-            .output()
-            .ok()
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .unwrap_or_else(|| "Unknown CPU".to_string());
+fn get_cpu() -> String {
+    if let Ok(contents) = fs::read_to_string("/proc/cpuinfo") {
+        let mut model = String::new();
+        let mut cores = 0;
 
-        let cores = Command::new("sysctl")
-            .args(&["-n", "hw.physicalcpu"])
-            .output()
-            .ok()
-            .and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
-            .unwrap_or(1);
+        for line in contents.lines() {
+            if line.starts_with("model name") {
+                model = line
+                    .split(':')
+                    .nth(1)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
+            } else if line.starts_with("processor") {
+                cores += 1;
+            }
+        }
 
-        let threads = Command::new("sysctl")
-            .args(&["-n", "hw.logicalcpu"])
-            .output()
-            .ok()
-            .and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
-            .unwrap_or(cores);
-
-        (model, cores, threads)
+        if !model.is_empty() {
+            return format!("{} ({} cores)", model, cores);
+        }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(target_os = "macos")]
     {
-        let mut model = "Unknown CPU".to_string();
-        let mut physical_cores = 0;
-        let mut thread_count = 0;
+        if let Ok(output) = Command::new("sysctl")
+            .arg("-n")
+            .arg("machdep.cpu.brand_string")
+            .output()
+        {
+            if let Ok(cpu_name) = String::from_utf8(output.stdout) {
+                if let Ok(cores_output) = Command::new("sysctl")
+                    .arg("-n")
+                    .arg("hw.ncpu")
+                    .output()
+                {
+                    if let Ok(cores_str) = String::from_utf8(cores_output.stdout) {
+                        return format!("{} ({} cores)", cpu_name.trim(), cores_str.trim());
+                    }
+                }
+                return cpu_name.trim().to_string();
+            }
+        }
+    }
 
-        if let Ok(file) = fs::File::open("/proc/cpuinfo") {
-            let reader = io::BufReader::new(file);
-            let mut core_ids = std::collections::HashSet::new();
+    "Unknown CPU".to_string()
+}
 
-            for line in reader.lines().filter_map(Result::ok) {
-                if line.starts_with("model name") && model == "Unknown CPU" {
-                    model = line.split(':').nth(1)
-                        .map(|s| s.trim().to_string())
-                        .unwrap_or(model);
-                } else if line.starts_with("processor") {
-                    thread_count += 1;
-                } else if line.starts_with("core id") {
-                    if let Some(id) = line.split(':').nth(1).and_then(|s| s.trim().parse::<usize>().ok()) {
-                        core_ids.insert(id);
+fn get_memory() -> String {
+    if let Ok(contents) = fs::read_to_string("/proc/meminfo") {
+        let mut total = 0;
+        let mut available = 0;
+
+        for line in contents.lines() {
+            if line.starts_with("MemTotal:") {
+                total = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+            } else if line.starts_with("MemAvailable:") {
+                available = line
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0);
+            }
+        }
+
+        if total > 0 {
+            let used = total - available;
+            return format!(
+                "{:.1} GiB / {:.1} GiB",
+                used as f64 / 1024.0 / 1024.0,
+                total as f64 / 1024.0 / 1024.0
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = Command::new("sysctl")
+            .arg("-n")
+            .arg("hw.memsize")
+            .output()
+        {
+            if let Ok(mem_str) = String::from_utf8(output.stdout) {
+                if let Ok(mem_bytes) = mem_str.trim().parse::<u64>() {
+                    return format!("{:.1} GiB", mem_bytes as f64 / 1024.0 / 1024.0 / 1024.0);
+                }
+            }
+        }
+    }
+
+    "Unknown".to_string()
+}
+
+fn get_all_gpus() -> Vec<String> {
+    let mut gpus = Vec::new();
+
+    // Method 1: NVIDIA GPUs via nvidia-smi
+    if let Ok(output) = Command::new("nvidia-smi")
+        .arg("--query-gpu=gpu_name")
+        .arg("--format=csv,noheader")
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(nvidia_output) = String::from_utf8(output.stdout) {
+                for line in nvidia_output.lines() {
+                    let gpu_name = line.trim();
+                    if !gpu_name.is_empty() {
+                        gpus.push(format!("NVIDIA {}", gpu_name));
                     }
                 }
             }
-
-            physical_cores = if core_ids.is_empty() { thread_count } else { core_ids.len() };
         }
-
-        (model, physical_cores.max(1), thread_count.max(1))
     }
 
-    #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-    {
-        let model = Command::new("sysctl")
-            .args(&["-n", "hw.model"])
-            .output()
-            .ok()
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-            .unwrap_or_else(|| "Unknown CPU".to_string());
-
-        let cores = Command::new("sysctl")
-            .args(&["-n", "hw.ncpu"])
-            .output()
-            .ok()
-            .and_then(|out| String::from_utf8_lossy(&out.stdout).trim().parse().ok())
-            .unwrap_or(1);
-
-        (model, cores, cores)
+    // Method 2: lspci for all GPUs (AMD, Intel, and NVIDIA as fallback)
+    if let Ok(output) = Command::new("lspci").output() {
+        if output.status.success() {
+            if let Ok(lspci_output) = String::from_utf8(output.stdout) {
+                for line in lspci_output.lines() {
+                    if line.contains("VGA compatible controller") || line.contains("3D controller") {
+                        if let Some(gpu_info) = line.split(':').nth(2) {
+                            let gpu_name = gpu_info.trim();
+                            // Avoid duplicates if nvidia-smi already found NVIDIA GPUs
+                            if !gpus.iter().any(|g| gpu_name.contains(&g.replace("NVIDIA ", ""))) {
+                                gpus.push(gpu_name.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))]
-    {
-        ("Unknown CPU".to_string(), 1, 1)
-    }
-}
-
-fn get_memory_info() -> String {
-    #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-    {
-        Command::new("sysctl")
-            .args(&["-n", "hw.memsize"])
-            .output()
-            .ok()
-            .and_then(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .trim()
-                    .parse::<u64>()
-                    .ok()
-                    .map(|bytes| format!("{:.2} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0))
-            })
-            .unwrap_or_else(|| "Unknown".to_string())
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        fs::read_to_string("/proc/meminfo")
-            .ok()
-            .and_then(|contents| {
-                contents.lines()
-                    .find(|line| line.starts_with("MemTotal:"))
-                    .and_then(|line| {
-                        line.split_whitespace()
-                            .nth(1)
-                            .and_then(|kb| kb.parse::<u64>().ok())
-                            .map(|kb| format!("{:.2} GB", kb as f64 / 1024.0 / 1024.0))
-                    })
-            })
-            .unwrap_or_else(|| "Unknown".to_string())
+    // Method 3: /sys/class/drm for additional GPU info on Linux
+    if gpus.is_empty() {
+        if let Ok(entries) = fs::read_dir("/sys/class/drm") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if let Some(name) = path.file_name() {
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("card") && !name_str.contains('-') {
+                        let vendor_path = path.join("device/vendor");
+                        let device_path = path.join("device/device");
+                        
+                        if let (Ok(vendor), Ok(device)) = (
+                            fs::read_to_string(&vendor_path),
+                            fs::read_to_string(&device_path)
+                        ) {
+                            let vendor_id = vendor.trim();
+                            let device_id = device.trim();
+                            gpus.push(format!("GPU (Vendor: {}, Device: {})", vendor_id, device_id));
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))]
-    {
-        "Unknown".to_string()
-    }
-}
-
-fn get_uptime() -> String {
-    #[cfg(target_os = "linux")]
-    {
-        fs::read_to_string("/proc/uptime")
-            .ok()
-            .and_then(|contents| {
-                contents.split_whitespace()
-                    .next()
-                    .and_then(|s| s.parse::<f64>().ok())
-                    .map(|secs| format_duration(secs as u64))
-            })
-            .unwrap_or_else(|| "Unknown".to_string())
-    }
-
+    // Method 4: macOS GPU detection
     #[cfg(target_os = "macos")]
     {
-        Command::new("sysctl")
-            .args(&["-n", "kern.boottime"])
-            .output()
-            .ok()
-            .and_then(|out| {
-                let output = String::from_utf8_lossy(&out.stdout);
-                output.split_whitespace()
-                    .nth(3)
-                    .and_then(|s| s.trim_matches(',').parse::<u64>().ok())
-                    .and_then(|boot_time| {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .ok()
-                            .map(|now| format_duration(now.as_secs() - boot_time))
-                    })
-            })
-            .unwrap_or_else(|| "Unknown".to_string())
+        if gpus.is_empty() {
+            if let Ok(output) = Command::new("system_profiler")
+                .arg("SPDisplaysDataType")
+                .output()
+            {
+                if let Ok(gpu_info) = String::from_utf8(output.stdout) {
+                    for line in gpu_info.lines() {
+                        if line.contains("Chipset Model:") {
+                            if let Some(model) = line.split(':').nth(1) {
+                                gpus.push(model.trim().to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        "Unknown".to_string()
+    if gpus.is_empty() {
+        gpus.push("No GPU detected".to_string());
     }
+
+    gpus
 }
 
-fn format_duration(seconds: u64) -> String {
-    let days = seconds / 86400;
-    let hours = (seconds % 86400) / 3600;
-    let minutes = (seconds % 3600) / 60;
-    
-    if days > 0 {
-        format!("{}d {}h {}m", days, hours, minutes)
-    } else if hours > 0 {
-        format!("{}h {}m", hours, minutes)
+fn get_os_logo(os_name: &str) -> Vec<String> {
+    let os_lower = os_name.to_lowercase();
+
+    if os_lower.contains("arch") || os_lower.contains("cachy") {
+        vec![
+            "      /\\      ".to_string(),
+            "     /  \\     ".to_string(),
+            "    /\\   \\    ".to_string(),
+            "   /  \\   \\   ".to_string(),
+            "  /    \\   \\  ".to_string(),
+            " /______\\___\\ ".to_string(),
+        ]
+    } else if os_lower.contains("ubuntu") {
+        vec![
+            "         _     ".to_string(),
+            "     ---(_)    ".to_string(),
+            " _/  ---  \\    ".to_string(),
+            "(_) |   |      ".to_string(),
+            "  \\  --- _/    ".to_string(),
+            "     ---(_)    ".to_string(),
+        ]
+    } else if os_lower.contains("debian") {
+        vec![
+            "  _____  ".to_string(),
+            " /  __ \\ ".to_string(),
+            "|  /    |".to_string(),
+            "|  \\___- ".to_string(),
+            " -_      ".to_string(),
+            "   --_   ".to_string(),
+        ]
+    } else if os_lower.contains("fedora") {
+        vec![
+            "      _____    ".to_string(),
+            "     /   __)\\  ".to_string(),
+            "     |  /  \\ \\ ".to_string(),
+            "  ___|  |__/ / ".to_string(),
+            " / (_    _)_/  ".to_string(),
+            "/ /  |  |      ".to_string(),
+        ]
+    } else if os_lower.contains("macos") || os_lower.contains("darwin") {
+        vec![
+            "       .:'     ".to_string(),
+            "    __ :'__    ".to_string(),
+            " .'`  `-'  ``. ".to_string(),
+            ":          .-' ".to_string(),
+            ":         :    ".to_string(),
+            " :         `-; ".to_string(),
+        ]
     } else {
-        format!("{}m", minutes)
+        vec![
+            "   ______   ".to_string(),
+            "  /      \\  ".to_string(),
+            " |  ◉  ◉  | ".to_string(),
+            " |    >   | ".to_string(),
+            " |  \\___/ | ".to_string(),
+            "  \\______/  ".to_string(),
+        ]
     }
 }
 
-fn get_gpu_info() -> String {
-    #[cfg(target_os = "macos")]
-    {
-        Command::new("system_profiler")
-            .args(&["SPDisplaysDataType"])
-            .output()
-            .ok()
-            .and_then(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .find(|line| line.trim().starts_with("Chipset Model:"))
-                    .map(|line| {
-                        line.trim()
-                            .trim_start_matches("Chipset Model:")
-                            .trim()
-                            .to_string()
-                    })
-            })
-            .unwrap_or_else(|| "Not detected".to_string())
+fn format_info(
+    hostname: &str,
+    os_name: &str,
+    kernel: &str,
+    uptime: &str,
+    shell: &str,
+    cpu: &str,
+    memory: &str,
+    gpus: &[String],
+) -> Vec<String> {
+    let mut info = Vec::new();
+
+    info.push(format!(
+        "{}{}{}",
+        colorize(&format!("{}", hostname), BOLD),
+        colorize("@", RESET),
+        colorize("rustfetch", BOLD)
+    ));
+    info.push("─".repeat(hostname.len() + 10));
+    info.push(format!("{}: {}", colorize("OS", CYAN), os_name));
+    info.push(format!("{}: {}", colorize("Kernel", CYAN), kernel));
+    info.push(format!("{}: {}", colorize("Uptime", CYAN), uptime));
+    info.push(format!("{}: {}", colorize("Shell", CYAN), shell));
+    info.push(format!("{}: {}", colorize("CPU", GREEN), cpu));
+    info.push(format!("{}: {}", colorize("Memory", YELLOW), memory));
+
+    for (i, gpu) in gpus.iter().enumerate() {
+        if i == 0 {
+            info.push(format!("{}: {}", colorize("GPU", MAGENTA), gpu));
+        } else {
+            info.push(format!("    {}", gpu));
+        }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
-    {
-        Command::new("lspci")
-            .output()
-            .ok()
-            .and_then(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .find(|line| {
-                        let lower = line.to_lowercase();
-                        lower.contains("vga") || lower.contains("3d controller")
-                    })
-                    .map(|line| {
-                        line.split(':')
-                            .skip(2)
-                            .collect::<Vec<_>>()
-                            .join(":")
-                            .trim()
-                            .to_string()
-                    })
-            })
-            .unwrap_or_else(|| "Not detected".to_string())
-    }
+    info
+}
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd")))]
-    {
-        "Not detected".to_string()
+fn display_side_by_side(logo: &[String], info: &[String]) {
+    let logo_width = logo.iter().map(|s| s.len()).max().unwrap_or(0);
+    let max_lines = logo.len().max(info.len());
+
+    for i in 0..max_lines {
+        let logo_line = if i < logo.len() {
+            format!("{:width$}", colorize(&logo[i], BLUE), width = logo_width + 10)
+        } else {
+            " ".repeat(logo_width + 4)
+        };
+
+        let info_line = if i < info.len() { &info[i] } else { "" };
+
+        println!("{}  {}", logo_line, info_line);
     }
 }
