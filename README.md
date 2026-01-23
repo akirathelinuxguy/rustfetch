@@ -67,7 +67,7 @@ You can also add or modify OS logos in the `get_os_icon()` function for more per
 
 ## License
 
-This project is licensed under the MIT License idk why it just seems better. See `LICENSE` for details.
+This project is licensed under the GPLv2 License idk why it just seems better. See `LICENSE` for details.
 
 ---
 
