@@ -1,744 +1,411 @@
-use std::fs;
-use std::process::Command;
-use std::thread;
-use std::sync::{Arc, Mutex};
-use std::io::{self, Write};
+use std::{fs, process::Command, thread, sync::{Arc, Mutex}, io::{self, Write}, collections::HashMap};
 
-// ============================================================================
-// ================================ CONFIG ====================================
-// ============================================================================
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                            CONFIGURATION                                  ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
 
-// Display Settings
-const PROGRESSIVE_DISPLAY: bool = true;     // Show info as it loads (fastfetch style)
-const USE_COLOR_OUTPUT: bool = true;        // Enable colored output
-const ENABLE_GPU_DETECTION: bool = true;    // Detect GPUs (can be slow)
+const PROGRESSIVE_DISPLAY: bool = true;      // Fastfetch-style progressive loading
+const USE_COLOR: bool = true;                // Colored output
+const CACHE_ENABLED: bool = true;            // Cache static info 2-3x faster on reruns
+const CACHE_FILE: &str = "/tmp/rustfetch_cache";
 
-// Info to Display (set to false to hide)
+// Display toggles - turn off what you don't want
+const SHOW_USER_HOST: bool = true;
 const SHOW_OS: bool = true;
 const SHOW_KERNEL: bool = true;
 const SHOW_UPTIME: bool = true;
+const SHOW_PACKAGES: bool = true;            // Pacman/dpkg/rpm package count
 const SHOW_SHELL: bool = true;
-const SHOW_DE: bool = true;                 // Desktop Environment
-const SHOW_WM: bool = true;                 // Window Manager
+const SHOW_DE: bool = true;                  // Desktop Environment
+const SHOW_WM: bool = true;                  // Window Manager
+const SHOW_WM_THEME: bool = true;            // WM Theme
 const SHOW_TERMINAL: bool = true;
 const SHOW_CPU: bool = true;
-const SHOW_MEMORY: bool = true;
 const SHOW_GPU: bool = true;
+const SHOW_MEMORY: bool = true;
+const SHOW_SWAP: bool = true;
 const SHOW_DISK: bool = true;
+const SHOW_DISK_DETAILED: bool = true;       // Show lsblk output
 const SHOW_LOCALE: bool = false;
+const SHOW_LOCAL_IP: bool = true;
+const SHOW_PUBLIC_IP: bool = false;          // Slower, requires internet
+const SHOW_BATTERY: bool = true;
+const SHOW_COLORS: bool = true;              // Color palette at bottom
 
-// ============================================================================
-// ============================= END CONFIG ===================================
-// ============================================================================
+// Colors (change as you like)
+const C_RESET: &str = "\x1b[0m";
+const C_BOLD: &str = "\x1b[1m";
+const C_CYAN: &str = "\x1b[96m";
+const C_GREEN: &str = "\x1b[92m";
+const C_YELLOW: &str = "\x1b[93m";
+const C_BLUE: &str = "\x1b[94m";
+const C_MAGENTA: &str = "\x1b[95m";
+const C_RED: &str = "\x1b[91m";
 
-const RESET: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const CYAN: &str = "\x1b[96m";
-const GREEN: &str = "\x1b[92m";
-const YELLOW: &str = "\x1b[93m";
-const BLUE: &str = "\x1b[94m";
-const MAGENTA: &str = "\x1b[95m";
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║                           END CONFIGURATION                               ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
 
-struct SystemInfo {
-    user: Option<String>,
-    hostname: Option<String>,
-    os_name: Option<String>,
-    kernel: Option<String>,
-    uptime: Option<String>,
-    shell: Option<String>,
-    de: Option<String>,
-    wm: Option<String>,
-    terminal: Option<String>,
-    cpu: Option<String>,
-    memory: Option<String>,
-    gpus: Option<Vec<String>>,
-    disk: Option<String>,
-    locale: Option<String>,
-}
+struct Info { user: Option<String>, hostname: Option<String>, os: Option<String>, kernel: Option<String>,
+    uptime: Option<String>, packages: Option<String>, shell: Option<String>, de: Option<String>,
+    wm: Option<String>, wm_theme: Option<String>, terminal: Option<String>, cpu: Option<String>,
+    gpu: Option<Vec<String>>, memory: Option<String>, swap: Option<String>, disk: Option<String>,
+    disk_detailed: Option<Vec<String>>, locale: Option<String>, local_ip: Option<String>,
+    public_ip: Option<String>, battery: Option<String>, }
 
-impl SystemInfo {
-    fn new() -> Self {
-        SystemInfo {
-            user: None,
-            hostname: None,
-            os_name: None,
-            kernel: None,
-            uptime: None,
-            shell: None,
-            de: None,
-            wm: None,
-            terminal: None,
-            cpu: None,
-            memory: None,
-            gpus: None,
-            disk: None,
-            locale: None,
-        }
-    }
+impl Info { fn new() -> Self { Info { user: None, hostname: None, os: None, kernel: None, uptime: None,
+    packages: None, shell: None, de: None, wm: None, wm_theme: None, terminal: None, cpu: None,
+    gpu: None, memory: None, swap: None, disk: None, disk_detailed: None, locale: None,
+    local_ip: None, public_ip: None, battery: None, } } }
+
+struct Cache { data: HashMap<String, String> }
+impl Cache {
+    fn load() -> Self { if !CACHE_ENABLED { return Cache { data: HashMap::new() }; }
+        let data = fs::read_to_string(CACHE_FILE).ok().and_then(|c| {
+            let mut m = HashMap::new(); for l in c.lines() { if let Some((k, v)) = l.split_once('=') {
+                m.insert(k.to_string(), v.to_string()); } } Some(m) }).unwrap_or_default();
+        Cache { data } }
+    fn get(&self, key: &str) -> Option<String> { self.data.get(key).cloned() }
+    fn set(&mut self, key: &str, value: String) { self.data.insert(key.to_string(), value); }
+    fn save(&self) { if !CACHE_ENABLED { return; }
+        let _ = fs::write(CACHE_FILE, self.data.iter().map(|(k,v)| format!("{}={}",k,v))
+            .collect::<Vec<_>>().join("\n")); }
 }
 
 fn main() {
-    let info = Arc::new(Mutex::new(SystemInfo::new()));
-    let logo_lines = Arc::new(Mutex::new(Vec::new()));
+    let cache = Arc::new(Mutex::new(Cache::load()));
+    let info = Arc::new(Mutex::new(Info::new()));
+    let logo = Arc::new(Mutex::new(Vec::new()));
 
     if PROGRESSIVE_DISPLAY {
-        let info_clone = Arc::clone(&info);
-        let logo_clone = Arc::clone(&logo_lines);
-        
-        let display_handle = thread::spawn(move || {
-            progressive_display(info_clone, logo_clone);
-        });
+        let i = Arc::clone(&info); let l = Arc::clone(&logo);
+        let display = thread::spawn(move || { let mut last = 0; loop {
+            thread::sleep(std::time::Duration::from_millis(20));
+            let ig = i.lock().unwrap(); let lg = l.lock().unwrap();
+            if last > 0 { print!("\x1b[{}A\x1b[J", last); }
+            last = display_info(&ig, &lg); io::stdout().flush().unwrap();
+            if check_loaded(&ig) { break; } } });
 
-        // Launch all data gathering threads
         let mut handles = vec![
-            {
-                let info = Arc::clone(&info);
-                thread::spawn(move || {
-                    let user = get_user();
-                    let hostname = get_hostname();
-                    let os_name = get_os_name();
-                    let mut guard = info.lock().unwrap();
-                    guard.user = Some(user);
-                    guard.hostname = Some(hostname);
-                    guard.os_name = Some(os_name.clone());
-                    drop(guard);
-                    
-                    let mut logo_guard = logo_lines.lock().unwrap();
-                    *logo_guard = get_os_logo(&os_name);
-                })
-            },
+            { let i = Arc::clone(&info); let c = Arc::clone(&cache);
+              thread::spawn(move || { let (u, h, o) = (get_user(), get_cached(&c, "host", get_hostname),
+                  get_cached(&c, "os", get_os)); let mut g = i.lock().unwrap();
+                  g.user = Some(u); g.hostname = Some(h); g.os = Some(o.clone()); drop(g);
+                  *logo.lock().unwrap() = get_logo(&o); }) }
         ];
+        if SHOW_KERNEL { let i = Arc::clone(&info); let c = Arc::clone(&cache);
+            handles.push(thread::spawn(move || { i.lock().unwrap().kernel = Some(get_cached(&c, "kernel", get_kernel)); })); }
+        if SHOW_UPTIME { let i = Arc::clone(&info);
+            handles.push(thread::spawn(move || { i.lock().unwrap().uptime = Some(get_uptime()); })); }
+        if SHOW_PACKAGES { let i = Arc::clone(&info); let c = Arc::clone(&cache);
+            handles.push(thread::spawn(move || { i.lock().unwrap().packages = Some(get_cached(&c, "pkgs", get_packages)); })); }
+        if SHOW_SHELL || SHOW_DE || SHOW_WM || SHOW_WM_THEME || SHOW_TERMINAL {
+            let i = Arc::clone(&info); let c = Arc::clone(&cache);
+            handles.push(thread::spawn(move || { let mut g = i.lock().unwrap();
+                if SHOW_SHELL { g.shell = Some(get_shell()); }
+                if SHOW_DE { g.de = Some(get_de()); }
+                if SHOW_WM { g.wm = Some(get_cached(&c, "wm", get_wm)); }
+                if SHOW_WM_THEME { g.wm_theme = Some(get_wm_theme()); }
+                if SHOW_TERMINAL { g.terminal = Some(get_terminal()); } })); }
+        if SHOW_CPU { let i = Arc::clone(&info); let c = Arc::clone(&cache);
+            handles.push(thread::spawn(move || { i.lock().unwrap().cpu = Some(get_cached(&c, "cpu", get_cpu)); })); }
+        if SHOW_GPU { let i = Arc::clone(&info); let c = Arc::clone(&cache);
+            handles.push(thread::spawn(move || { i.lock().unwrap().gpu = Some(get_cached_vec(&c, "gpu", get_gpu)); })); }
+        if SHOW_MEMORY || SHOW_SWAP { let i = Arc::clone(&info);
+            handles.push(thread::spawn(move || { let (m, s) = get_memory_swap();
+                let mut g = i.lock().unwrap(); if SHOW_MEMORY { g.memory = Some(m); }
+                if SHOW_SWAP { g.swap = Some(s); } })); }
+        if SHOW_DISK { let i = Arc::clone(&info);
+            handles.push(thread::spawn(move || { i.lock().unwrap().disk = Some(get_disk()); })); }
+        if SHOW_DISK_DETAILED { let i = Arc::clone(&info);
+            handles.push(thread::spawn(move || { i.lock().unwrap().disk_detailed = Some(get_lsblk()); })); }
+        if SHOW_LOCALE { let i = Arc::clone(&info);
+            handles.push(thread::spawn(move || { i.lock().unwrap().locale = Some(get_locale()); })); }
+        if SHOW_LOCAL_IP { let i = Arc::clone(&info);
+            handles.push(thread::spawn(move || { i.lock().unwrap().local_ip = Some(get_local_ip()); })); }
+        if SHOW_PUBLIC_IP { let i = Arc::clone(&info);
+            handles.push(thread::spawn(move || { i.lock().unwrap().public_ip = Some(get_public_ip()); })); }
+        if SHOW_BATTERY { let i = Arc::clone(&info);
+            handles.push(thread::spawn(move || { i.lock().unwrap().battery = Some(get_battery()); })); }
 
-        if SHOW_KERNEL {
-            let info = Arc::clone(&info);
-            handles.push(thread::spawn(move || {
-                info.lock().unwrap().kernel = Some(get_kernel());
-            }));
-        }
-
-        if SHOW_UPTIME {
-            let info = Arc::clone(&info);
-            handles.push(thread::spawn(move || {
-                info.lock().unwrap().uptime = Some(get_uptime());
-            }));
-        }
-
-        if SHOW_SHELL || SHOW_DE || SHOW_WM || SHOW_TERMINAL {
-            let info = Arc::clone(&info);
-            handles.push(thread::spawn(move || {
-                let shell = if SHOW_SHELL { Some(get_shell()) } else { None };
-                let de = if SHOW_DE { Some(get_desktop_environment()) } else { None };
-                let wm = if SHOW_WM { Some(get_window_manager()) } else { None };
-                let terminal = if SHOW_TERMINAL { Some(get_terminal()) } else { None };
-                let mut guard = info.lock().unwrap();
-                guard.shell = shell;
-                guard.de = de;
-                guard.wm = wm;
-                guard.terminal = terminal;
-            }));
-        }
-
-        if SHOW_CPU {
-            let info = Arc::clone(&info);
-            handles.push(thread::spawn(move || {
-                info.lock().unwrap().cpu = Some(get_cpu());
-            }));
-        }
-
-        if SHOW_MEMORY {
-            let info = Arc::clone(&info);
-            handles.push(thread::spawn(move || {
-                info.lock().unwrap().memory = Some(get_memory());
-            }));
-        }
-
-        if SHOW_GPU && ENABLE_GPU_DETECTION {
-            let info = Arc::clone(&info);
-            handles.push(thread::spawn(move || {
-                info.lock().unwrap().gpus = Some(get_all_gpus());
-            }));
-        }
-
-        if SHOW_DISK {
-            let info = Arc::clone(&info);
-            handles.push(thread::spawn(move || {
-                info.lock().unwrap().disk = Some(get_disk_usage());
-            }));
-        }
-
-        if SHOW_LOCALE {
-            let info = Arc::clone(&info);
-            handles.push(thread::spawn(move || {
-                info.lock().unwrap().locale = Some(get_locale());
-            }));
-        }
-
-        for handle in handles {
-            let _ = handle.join();
-        }
-
-        let _ = display_handle.join();
+        for h in handles { let _ = h.join(); }
+        cache.lock().unwrap().save();
+        let _ = display.join();
     } else {
-        // Fast mode - no progressive display
-        let user = get_user();
-        let hostname = get_hostname();
-        let os_name = get_os_name();
-        let kernel = if SHOW_KERNEL { get_kernel() } else { String::new() };
-        let uptime = if SHOW_UPTIME { get_uptime() } else { String::new() };
-        let shell = if SHOW_SHELL { get_shell() } else { String::new() };
-        let de = if SHOW_DE { get_desktop_environment() } else { String::new() };
-        let wm = if SHOW_WM { get_window_manager() } else { String::new() };
-        let terminal = if SHOW_TERMINAL { get_terminal() } else { String::new() };
-        let cpu = if SHOW_CPU { get_cpu() } else { String::new() };
-        let memory = if SHOW_MEMORY { get_memory() } else { String::new() };
-        let gpus = if SHOW_GPU && ENABLE_GPU_DETECTION { get_all_gpus() } else { vec![] };
-        let disk = if SHOW_DISK { get_disk_usage() } else { String::new() };
-        let locale = if SHOW_LOCALE { get_locale() } else { String::new() };
-
-        let logo = get_os_logo(&os_name);
-        let info_lines = format_info_full(&user, &hostname, &os_name, &kernel, &uptime, &shell, 
-            &de, &wm, &terminal, &cpu, &memory, &gpus, &disk, &locale);
-
-        display_side_by_side(&logo, &info_lines);
+        let (user, host, os) = (get_user(), get_cached(&cache, "host", get_hostname), get_cached(&cache, "os", get_os));
+        *logo.lock().unwrap() = get_logo(&os);
+        let mut i = info.lock().unwrap();
+        i.user = Some(user); i.hostname = Some(host); i.os = Some(os);
+        if SHOW_KERNEL { i.kernel = Some(get_cached(&cache, "kernel", get_kernel)); }
+        if SHOW_UPTIME { i.uptime = Some(get_uptime()); }
+        if SHOW_PACKAGES { i.packages = Some(get_cached(&cache, "pkgs", get_packages)); }
+        if SHOW_SHELL { i.shell = Some(get_shell()); }
+        if SHOW_DE { i.de = Some(get_de()); }
+        if SHOW_WM { i.wm = Some(get_cached(&cache, "wm", get_wm)); }
+        if SHOW_WM_THEME { i.wm_theme = Some(get_wm_theme()); }
+        if SHOW_TERMINAL { i.terminal = Some(get_terminal()); }
+        if SHOW_CPU { i.cpu = Some(get_cached(&cache, "cpu", get_cpu)); }
+        if SHOW_GPU { i.gpu = Some(get_cached_vec(&cache, "gpu", get_gpu)); }
+        if SHOW_MEMORY || SHOW_SWAP { let (m, s) = get_memory_swap();
+            if SHOW_MEMORY { i.memory = Some(m); } if SHOW_SWAP { i.swap = Some(s); } }
+        if SHOW_DISK { i.disk = Some(get_disk()); }
+        if SHOW_DISK_DETAILED { i.disk_detailed = Some(get_lsblk()); }
+        if SHOW_LOCALE { i.locale = Some(get_locale()); }
+        if SHOW_LOCAL_IP { i.local_ip = Some(get_local_ip()); }
+        if SHOW_PUBLIC_IP { i.public_ip = Some(get_public_ip()); }
+        if SHOW_BATTERY { i.battery = Some(get_battery()); }
+        drop(i); cache.lock().unwrap().save();
+        display_info(&info.lock().unwrap(), &logo.lock().unwrap());
     }
 }
 
-fn progressive_display(info: Arc<Mutex<SystemInfo>>, logo_lines: Arc<Mutex<Vec<String>>>) {
-    let mut last_line_count = 0;
-    let required_fields = 3; // user, hostname, os_name are always required
-    
-    loop {
-        thread::sleep(std::time::Duration::from_millis(30));
-        
-        let info_guard = info.lock().unwrap();
-        let logo_guard = logo_lines.lock().unwrap();
-        
-        let info_lines = format_info_progressive(&info_guard);
-        
-        if last_line_count > 0 {
-            print!("\x1b[{}A\x1b[J", last_line_count);
-        }
-        
-        let line_count = display_side_by_side(&logo_guard, &info_lines);
-        last_line_count = line_count;
-        io::stdout().flush().unwrap();
-        
-        // Check if all enabled fields are loaded
-        let mut all_loaded = info_guard.user.is_some() && 
-                             info_guard.hostname.is_some() && 
-                             info_guard.os_name.is_some();
-        
-        if SHOW_KERNEL { all_loaded &= info_guard.kernel.is_some(); }
-        if SHOW_UPTIME { all_loaded &= info_guard.uptime.is_some(); }
-        if SHOW_SHELL { all_loaded &= info_guard.shell.is_some(); }
-        if SHOW_DE { all_loaded &= info_guard.de.is_some(); }
-        if SHOW_WM { all_loaded &= info_guard.wm.is_some(); }
-        if SHOW_TERMINAL { all_loaded &= info_guard.terminal.is_some(); }
-        if SHOW_CPU { all_loaded &= info_guard.cpu.is_some(); }
-        if SHOW_MEMORY { all_loaded &= info_guard.memory.is_some(); }
-        if SHOW_DISK { all_loaded &= info_guard.disk.is_some(); }
-        if SHOW_LOCALE { all_loaded &= info_guard.locale.is_some(); }
-        if SHOW_GPU && ENABLE_GPU_DETECTION { all_loaded &= info_guard.gpus.is_some(); }
-        
-        if all_loaded {
-            break;
-        }
-    }
+fn check_loaded(i: &Info) -> bool {
+    i.user.is_some() && i.hostname.is_some() && i.os.is_some() &&
+    (!SHOW_KERNEL || i.kernel.is_some()) && (!SHOW_UPTIME || i.uptime.is_some()) &&
+    (!SHOW_PACKAGES || i.packages.is_some()) && (!SHOW_SHELL || i.shell.is_some()) &&
+    (!SHOW_DE || i.de.is_some()) && (!SHOW_WM || i.wm.is_some()) &&
+    (!SHOW_WM_THEME || i.wm_theme.is_some()) && (!SHOW_TERMINAL || i.terminal.is_some()) &&
+    (!SHOW_CPU || i.cpu.is_some()) && (!SHOW_GPU || i.gpu.is_some()) &&
+    (!SHOW_MEMORY || i.memory.is_some()) && (!SHOW_SWAP || i.swap.is_some()) &&
+    (!SHOW_DISK || i.disk.is_some()) && (!SHOW_DISK_DETAILED || i.disk_detailed.is_some()) &&
+    (!SHOW_LOCALE || i.locale.is_some()) && (!SHOW_LOCAL_IP || i.local_ip.is_some()) &&
+    (!SHOW_PUBLIC_IP || i.public_ip.is_some()) && (!SHOW_BATTERY || i.battery.is_some())
 }
 
-fn format_info_progressive(info: &SystemInfo) -> Vec<String> {
+fn display_info(i: &Info, logo: &[String]) -> usize {
     let mut lines = Vec::new();
+    if let (Some(u), Some(h)) = (&i.user, &i.hostname) {
+        lines.push(format!("{}{}{}", c(&u, C_BOLD), c("@", C_RESET), c(&h, C_BOLD)));
+        lines.push("─".repeat(u.len() + h.len() + 1)); }
+    if SHOW_OS { if let Some(o) = &i.os { lines.push(format!("{}: {}", c("OS", C_CYAN), o)); } }
+    if SHOW_KERNEL { if let Some(k) = &i.kernel { lines.push(format!("{}: {}", c("Kernel", C_CYAN), k)); } }
+    if SHOW_UPTIME { if let Some(u) = &i.uptime { lines.push(format!("{}: {}", c("Uptime", C_CYAN), u)); } }
+    if SHOW_PACKAGES { if let Some(p) = &i.packages { lines.push(format!("{}: {}", c("Packages", C_CYAN), p)); } }
+    if SHOW_SHELL { if let Some(s) = &i.shell { lines.push(format!("{}: {}", c("Shell", C_CYAN), s)); } }
+    if SHOW_DE { if let Some(d) = &i.de { if d != "Unknown" { lines.push(format!("{}: {}", c("DE", C_CYAN), d)); } } }
+    if SHOW_WM { if let Some(w) = &i.wm { if w != "Unknown" { lines.push(format!("{}: {}", c("WM", C_CYAN), w)); } } }
+    if SHOW_WM_THEME { if let Some(t) = &i.wm_theme { if t != "Unknown" { lines.push(format!("{}: {}", c("Theme", C_CYAN), t)); } } }
+    if SHOW_TERMINAL { if let Some(t) = &i.terminal { if t != "Unknown" { lines.push(format!("{}: {}", c("Terminal", C_CYAN), t)); } } }
+    if SHOW_CPU { if let Some(cpu) = &i.cpu { lines.push(format!("{}: {}", c("CPU", C_GREEN), cpu)); } }
+    if SHOW_GPU { if let Some(gs) = &i.gpu { for (idx, g) in gs.iter().enumerate() {
+        lines.push(if idx == 0 { format!("{}: {}", c("GPU", C_MAGENTA), g) } else { format!("    {}", g) }); } } }
+    if SHOW_MEMORY { if let Some(m) = &i.memory { lines.push(format!("{}: {}", c("Memory", C_YELLOW), m)); } }
+    if SHOW_SWAP { if let Some(s) = &i.swap { if s != "0 B" { lines.push(format!("{}: {}", c("Swap", C_YELLOW), s)); } } }
+    if SHOW_DISK { if let Some(d) = &i.disk { lines.push(format!("{}: {}", c("Disk (/)", C_BLUE), d)); } }
+    if SHOW_DISK_DETAILED { if let Some(ds) = &i.disk_detailed { for (idx, d) in ds.iter().enumerate() {
+        lines.push(if idx == 0 { format!("{}: {}", c("Disks", C_BLUE), d) } else { format!("       {}", d) }); } } }
+    if SHOW_LOCALE { if let Some(l) = &i.locale { if l != "Unknown" { lines.push(format!("{}: {}", c("Locale", C_CYAN), l)); } } }
+    if SHOW_LOCAL_IP { if let Some(ip) = &i.local_ip { if ip != "Unknown" { lines.push(format!("{}: {}", c("Local IP", C_GREEN), ip)); } } }
+    if SHOW_PUBLIC_IP { if let Some(ip) = &i.public_ip { if ip != "Unknown" { lines.push(format!("{}: {}", c("Public IP", C_GREEN), ip)); } } }
+    if SHOW_BATTERY { if let Some(b) = &i.battery { if b != "Unknown" { lines.push(format!("{}: {}", c("Battery", C_RED), b)); } } }
+    if SHOW_COLORS { lines.push("".to_string());
+        lines.push(format!("{}███{}███{}███{}███{}███{}███{}███{}███{}",
+            "\x1b[40m", "\x1b[41m", "\x1b[42m", "\x1b[43m", "\x1b[44m", "\x1b[45m", "\x1b[46m", "\x1b[47m", C_RESET)); }
     
-    if let (Some(user), Some(hostname)) = (&info.user, &info.hostname) {
-        lines.push(format!(
-            "{}{}{}",
-            colorize(&format!("{}", user), BOLD),
-            colorize("@", RESET),
-            colorize(&hostname, BOLD)
-        ));
-        lines.push("─".repeat(user.len() + hostname.len() + 1));
-    }
-    
-    if SHOW_OS {
-        if let Some(os_name) = &info.os_name {
-            lines.push(format!("{}: {}", colorize("OS", CYAN), os_name));
-        }
-    }
-    
-    if SHOW_KERNEL {
-        if let Some(kernel) = &info.kernel {
-            lines.push(format!("{}: {}", colorize("Kernel", CYAN), kernel));
-        }
-    }
-    
-    if SHOW_UPTIME {
-        if let Some(uptime) = &info.uptime {
-            lines.push(format!("{}: {}", colorize("Uptime", CYAN), uptime));
-        }
-    }
-    
-    if SHOW_SHELL {
-        if let Some(shell) = &info.shell {
-            lines.push(format!("{}: {}", colorize("Shell", CYAN), shell));
-        }
-    }
-    
-    if SHOW_DE {
-        if let Some(de) = &info.de {
-            if de != "Unknown" {
-                lines.push(format!("{}: {}", colorize("DE", CYAN), de));
-            }
-        }
-    }
-    
-    if SHOW_WM {
-        if let Some(wm) = &info.wm {
-            if wm != "Unknown" {
-                lines.push(format!("{}: {}", colorize("WM", CYAN), wm));
-            }
-        }
-    }
-    
-    if SHOW_TERMINAL {
-        if let Some(terminal) = &info.terminal {
-            if terminal != "Unknown" {
-                lines.push(format!("{}: {}", colorize("Terminal", CYAN), terminal));
-            }
-        }
-    }
-    
-    if SHOW_CPU {
-        if let Some(cpu) = &info.cpu {
-            lines.push(format!("{}: {}", colorize("CPU", GREEN), cpu));
-        }
-    }
-    
-    if SHOW_MEMORY {
-        if let Some(memory) = &info.memory {
-            lines.push(format!("{}: {}", colorize("Memory", YELLOW), memory));
-        }
-    }
-    
-    if SHOW_GPU {
-        if let Some(gpus) = &info.gpus {
-            for (i, gpu) in gpus.iter().enumerate() {
-                if i == 0 {
-                    lines.push(format!("{}: {}", colorize("GPU", MAGENTA), gpu));
-                } else {
-                    lines.push(format!("    {}", gpu));
-                }
-            }
-        }
-    }
-    
-    if SHOW_DISK {
-        if let Some(disk) = &info.disk {
-            lines.push(format!("{}: {}", colorize("Disk", BLUE), disk));
-        }
-    }
-    
-    if SHOW_LOCALE {
-        if let Some(locale) = &info.locale {
-            if locale != "Unknown" {
-                lines.push(format!("{}: {}", colorize("Locale", CYAN), locale));
-            }
-        }
-    }
-    
-    lines
+    let lw = logo.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let ml = logo.len().max(lines.len());
+    for idx in 0..ml {
+        let ll = if idx < logo.len() { format!("{:width$}", c(&logo[idx], C_BLUE), width = lw + 10) } else { " ".repeat(lw + 4) };
+        let il = if idx < lines.len() { &lines[idx] } else { "" };
+        println!("{}  {}", ll, il); }
+    ml
 }
 
-fn format_info_full(user: &str, hostname: &str, os_name: &str, kernel: &str, uptime: &str, 
-    shell: &str, de: &str, wm: &str, terminal: &str, cpu: &str, memory: &str, 
-    gpus: &[String], disk: &str, locale: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    
-    lines.push(format!(
-        "{}{}{}",
-        colorize(user, BOLD),
-        colorize("@", RESET),
-        colorize(hostname, BOLD)
-    ));
-    lines.push("─".repeat(user.len() + hostname.len() + 1));
-    
-    if SHOW_OS { lines.push(format!("{}: {}", colorize("OS", CYAN), os_name)); }
-    if SHOW_KERNEL { lines.push(format!("{}: {}", colorize("Kernel", CYAN), kernel)); }
-    if SHOW_UPTIME { lines.push(format!("{}: {}", colorize("Uptime", CYAN), uptime)); }
-    if SHOW_SHELL { lines.push(format!("{}: {}", colorize("Shell", CYAN), shell)); }
-    if SHOW_DE && de != "Unknown" { lines.push(format!("{}: {}", colorize("DE", CYAN), de)); }
-    if SHOW_WM && wm != "Unknown" { lines.push(format!("{}: {}", colorize("WM", CYAN), wm)); }
-    if SHOW_TERMINAL && terminal != "Unknown" { lines.push(format!("{}: {}", colorize("Terminal", CYAN), terminal)); }
-    if SHOW_CPU { lines.push(format!("{}: {}", colorize("CPU", GREEN), cpu)); }
-    if SHOW_MEMORY { lines.push(format!("{}: {}", colorize("Memory", YELLOW), memory)); }
-    
-    if SHOW_GPU {
-        for (i, gpu) in gpus.iter().enumerate() {
-            if i == 0 {
-                lines.push(format!("{}: {}", colorize("GPU", MAGENTA), gpu));
-            } else {
-                lines.push(format!("    {}", gpu));
-            }
-        }
+#[inline(always)] fn c(t: &str, col: &str) -> String { if USE_COLOR { format!("{}{}{}", col, t, C_RESET) } else { t.to_string() } }
+#[inline(always)] fn get_user() -> String { std::env::var("USER").or_else(|_| std::env::var("USERNAME")).unwrap_or_else(|_| "unknown".to_string()) }
+fn get_hostname() -> String { fs::read_to_string("/etc/hostname").unwrap_or_else(|_| 
+    cmd("hostname").unwrap_or_else(|| "unknown".to_string())).trim().to_string() }
+fn get_os() -> String { fs::read_to_string("/etc/os-release").ok().and_then(|c| 
+    c.lines().find_map(|l| l.strip_prefix("PRETTY_NAME=")).map(|s| s.trim_matches('"').to_string()))
+    .unwrap_or_else(|| "Unknown OS".to_string()) }
+fn get_kernel() -> String { cmd("uname -r").unwrap_or_else(|| "Unknown".to_string()) }
+fn get_uptime() -> String { fs::read_to_string("/proc/uptime").ok().and_then(|c| 
+    c.split_whitespace().next().and_then(|s| s.parse::<f64>().ok().map(|sec| {
+        let d = (sec / 86400.0) as u64; let h = ((sec % 86400.0) / 3600.0) as u64;
+        let m = ((sec % 3600.0) / 60.0) as u64;
+        match (d, h) { (dd, hh) if dd > 0 => format!("{}d {}h {}m", dd, hh, m),
+            (_, hh) if hh > 0 => format!("{}h {}m", hh, m), _ => format!("{}m", m) } })))
+    .unwrap_or_else(|| "Unknown".to_string()) }
+fn get_packages() -> String {
+    let mut count = 0;
+    if let Ok(o) = Command::new("pacman").arg("-Qq").output() {
+        if let Ok(s) = String::from_utf8(o.stdout) { count += s.lines().count(); }
+    } else if let Ok(o) = Command::new("dpkg").arg("-l").output() {
+        if let Ok(s) = String::from_utf8(o.stdout) { count += s.lines().count().saturating_sub(5); }
+    } else if let Ok(o) = Command::new("rpm").arg("-qa").output() {
+        if let Ok(s) = String::from_utf8(o.stdout) { count += s.lines().count(); }
     }
-    
-    if SHOW_DISK { lines.push(format!("{}: {}", colorize("Disk", BLUE), disk)); }
-    if SHOW_LOCALE && locale != "Unknown" { lines.push(format!("{}: {}", colorize("Locale", CYAN), locale)); }
-    
-    lines
+    if count > 0 { count.to_string() } else { "Unknown".to_string() }
 }
-
-#[inline(always)]
-fn colorize(text: &str, color: &str) -> String {
-    if USE_COLOR_OUTPUT {
-        format!("{}{}{}", color, text, RESET)
-    } else {
-        text.to_string()
-    }
+#[inline(always)] fn get_shell() -> String { std::env::var("SHELL").ok().and_then(|s| 
+    s.rsplit('/').next().map(String::from)).unwrap_or_else(|| "unknown".to_string()) }
+fn get_de() -> String { std::env::var("XDG_CURRENT_DESKTOP").or_else(|_| std::env::var("DESKTOP_SESSION"))
+    .unwrap_or_else(|_| if std::env::var("GNOME_DESKTOP_SESSION_ID").is_ok() { "GNOME".to_string() }
+    else if std::env::var("KDE_FULL_SESSION").is_ok() { "KDE".to_string() } else { "Unknown".to_string() }) }
+fn get_wm() -> String { for wm in &["hyprland", "sway", "i3", "bspwm", "awesome", "dwm", "openbox", "xmonad"] {
+    if cmd(&format!("pgrep -x {}", wm)).is_some() { return wm.to_string(); } } "Unknown".to_string() }
+fn get_wm_theme() -> String { 
+    std::env::var("GTK_THEME").ok().or_else(|| 
+        fs::read_to_string(format!("{}/.config/gtk-3.0/settings.ini", std::env::var("HOME").unwrap_or_default()))
+        .ok().and_then(|c| c.lines().find_map(|l| l.strip_prefix("gtk-theme-name=").map(String::from))))
+    .unwrap_or_else(|| "Unknown".to_string()) 
 }
-
-#[inline(always)]
-fn get_user() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
-}
-
-fn get_hostname() -> String {
-    fs::read_to_string("/etc/hostname")
-        .or_else(|_| {
-            Command::new("hostname")
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, ""))
-        })
-        .unwrap_or_else(|_| "unknown".to_string())
-        .trim()
-        .to_string()
-}
-
-fn get_os_name() -> String {
-    if let Ok(contents) = fs::read_to_string("/etc/os-release") {
-        for line in contents.lines() {
-            if let Some(name) = line.strip_prefix("PRETTY_NAME=") {
-                return name.trim_matches('"').to_string();
+fn get_terminal() -> String { std::env::var("TERM_PROGRAM").or_else(|_| std::env::var("TERMINAL"))
+    .unwrap_or_else(|_| "Unknown".to_string()) }
+fn get_cpu() -> String { 
+    fs::read_to_string("/proc/cpuinfo").ok().and_then(|c| {
+        let mut m = None; 
+        let mut core_count = 0; 
+        
+        for l in c.lines() {
+            if m.is_none() && l.starts_with("model name") { 
+                m = l.split(':').nth(1).map(|s| 
+                    s.trim().replace("(R)", "").replace("(TM)", "").replace("  ", " ").trim().to_string()); 
+            }
+            if l.starts_with("processor") { 
+                core_count += 1; 
             }
         }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = Command::new("sw_vers").arg("-productVersion").output() {
-            if let Ok(version) = String::from_utf8(output.stdout) {
-                return format!("macOS {}", version.trim());
-            }
-        }
-        return "macOS".to_string();
-    }
-
-    "Unknown OS".to_string()
+        
+        m.map(|mm| format!("{} ({} cores)", mm, core_count)) 
+    }).unwrap_or_else(|| "Unknown CPU".to_string()) 
 }
-
-fn get_kernel() -> String {
-    Command::new("uname")
-        .arg("-r")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "Unknown".to_string())
-}
-
-fn get_uptime() -> String {
-    if let Ok(contents) = fs::read_to_string("/proc/uptime") {
-        if let Some(uptime_str) = contents.split_whitespace().next() {
-            if let Ok(secs) = uptime_str.parse::<f64>() {
-                let days = (secs / 86400.0) as u64;
-                let hours = ((secs % 86400.0) / 3600.0) as u64;
-                let mins = ((secs % 3600.0) / 60.0) as u64;
-
-                return match (days, hours) {
-                    (d, h) if d > 0 => format!("{}d {}h {}m", d, h, mins),
-                    (_, h) if h > 0 => format!("{}h {}m", h, mins),
-                    _ => format!("{}m", mins),
-                };
-            }
-        }
-    }
-    "Unknown".to_string()
-}
-
-#[inline(always)]
-fn get_shell() -> String {
-    std::env::var("SHELL")
-        .ok()
-        .and_then(|s| s.rsplit('/').next().map(String::from))
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn get_desktop_environment() -> String {
-    std::env::var("XDG_CURRENT_DESKTOP")
-        .or_else(|_| std::env::var("DESKTOP_SESSION"))
-        .unwrap_or_else(|_| {
-            if std::env::var("GNOME_DESKTOP_SESSION_ID").is_ok() {
-                "GNOME".to_string()
-            } else if std::env::var("KDE_FULL_SESSION").is_ok() {
-                "KDE".to_string()
-            } else if std::env::var("MATE_DESKTOP_SESSION_ID").is_ok() {
-                "MATE".to_string()
-            } else {
-                "Unknown".to_string()
-            }
-        })
-}
-
-fn get_window_manager() -> String {
-    // Fast WM detection via processes
-    let wms = ["hyprland", "sway", "i3", "bspwm", "awesome", "dwm", "openbox", "xmonad", "qtile"];
-    for wm in &wms {
-        if let Ok(output) = Command::new("pgrep").arg("-x").arg(wm).output() {
-            if output.status.success() && !output.stdout.is_empty() {
-                return wm.to_string();
-            }
-        }
-    }
-    "Unknown".to_string()
-}
-
-fn get_terminal() -> String {
-    std::env::var("TERM_PROGRAM")
-        .or_else(|_| std::env::var("TERMINAL"))
-        .unwrap_or_else(|_| "Unknown".to_string())
-}
-
-fn get_cpu() -> String {
-    if let Ok(contents) = fs::read_to_string("/proc/cpuinfo") {
-        let mut model = None;
-        let mut cores = 0;
-
-        for line in contents.lines() {
-            if model.is_none() && line.starts_with("model name") {
-                model = line.split(':').nth(1).map(|s| {
-                    s.trim()
-                        .replace("(R)", "")
-                        .replace("(TM)", "")
-                        .replace("  ", " ")
-                        .trim()
-                        .to_string()
-                });
-            } else if line.starts_with("processor") {
-                cores += 1;
-            }
-            if model.is_some() && cores > 0 && line.is_empty() {
-                break;
-            }
-        }
-
-        if let Some(m) = model {
-            return format!("{} ({} cores)", m, cores);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let cpu_name = Command::new("sysctl")
-            .args(&["-n", "machdep.cpu.brand_string"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string());
-
-        let cores = Command::new("sysctl")
-            .args(&["-n", "hw.ncpu"])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string());
-
-        if let (Some(name), Some(c)) = (cpu_name, cores) {
-            return format!("{} ({} cores)", name, c);
-        }
-    }
-
-    "Unknown CPU".to_string()
-}
-
-fn get_memory() -> String {
-    if let Ok(contents) = fs::read_to_string("/proc/meminfo") {
-        let mut total = None;
-        let mut available = None;
-
-        for line in contents.lines() {
-            if total.is_none() && line.starts_with("MemTotal:") {
-                total = line.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok());
-            } else if available.is_none() && line.starts_with("MemAvailable:") {
-                available = line.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok());
-            }
-            
-            if total.is_some() && available.is_some() {
-                break;
-            }
-        }
-
-        if let (Some(t), Some(a)) = (total, available) {
-            let used = t - a;
-            return format!(
-                "{:.1} GiB / {:.1} GiB",
-                used as f64 / 1048576.0,
-                t as f64 / 1048576.0
-            );
-        }
-    }
-    "Unknown".to_string()
-}
-
-fn get_all_gpus() -> Vec<String> {
+fn get_gpu() -> Vec<String> {
     let mut gpus = Vec::new();
-
-    // NVIDIA via nvidia-smi
-    if let Ok(output) = Command::new("nvidia-smi")
-        .args(&["--query-gpu=gpu_name", "--format=csv,noheader"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(nvidia_output) = String::from_utf8(output.stdout) {
-                gpus.extend(
-                    nvidia_output
-                        .lines()
-                        .map(|line| line.trim())
-                        .filter(|line| !line.is_empty())
-                        .map(|line| format!("NVIDIA {}", line))
-                );
-            }
-        }
-    }
-
-    // lspci for all GPUs
-    if let Ok(output) = Command::new("lspci").output() {
-        if output.status.success() {
-            if let Ok(lspci_output) = String::from_utf8(output.stdout) {
-                for line in lspci_output.lines() {
-                    if line.contains("VGA compatible controller") || line.contains("3D controller") {
-                        if let Some(gpu_info) = line.split(':').nth(2) {
-                            let gpu_name = gpu_info.trim();
-                            let is_duplicate = gpus.iter().any(|g| {
-                                gpu_name.contains(&g.replace("NVIDIA ", ""))
-                            });
-                            if !is_duplicate {
-                                gpus.push(gpu_name.to_string());
-                            }
-                        }
+    let mut seen_names = std::collections::HashSet::new();
+    
+    // Method 1: NVIDIA GPUs via nvidia-smi (most accurate for NVIDIA)
+    if let Ok(o) = Command::new("nvidia-smi").args(&["--query-gpu=gpu_name", "--format=csv,noheader"]).output() {
+        if o.status.success() { 
+            if let Ok(s) = String::from_utf8(o.stdout) {
+                for line in s.lines().filter(|l| !l.is_empty()) {
+                    let gpu = line.trim().to_string();
+                    if seen_names.insert(gpu.to_lowercase()) {
+                        gpus.push(format!("NVIDIA {}", gpu));
                     }
                 }
-            }
-        }
-    }
-
-    if gpus.is_empty() {
-        gpus.push("No GPU detected".to_string());
-    }
-
-    gpus
-}
-
-fn get_disk_usage() -> String {
-    if let Ok(output) = Command::new("df").args(&["-h", "/"]).output() {
-        if let Ok(df_output) = String::from_utf8(output.stdout) {
-            if let Some(line) = df_output.lines().nth(1) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 {
-                    return format!("{} / {} ({})", parts[2], parts[1], parts[4]);
-                }
-            }
-        }
-    }
-    "Unknown".to_string()
-}
-
-fn get_locale() -> String {
-    std::env::var("LANG")
-        .or_else(|_| std::env::var("LC_ALL"))
-        .unwrap_or_else(|_| "Unknown".to_string())
-}
-
-fn get_os_logo(os_name: &str) -> Vec<String> {
-    let os_lower = os_name.to_lowercase();
-
-    if os_lower.contains("arch") || os_lower.contains("cachy") {
-        vec![
-            "      /\\      ",
-            "     /  \\     ",
-            "    /\\   \\    ",
-            "   /  \\   \\   ",
-            "  /    \\   \\  ",
-            " /______\\___\\ ",
-        ]
-    } else if os_lower.contains("ubuntu") {
-        vec![
-            "         _     ",
-            "     ---(_)    ",
-            " _/  ---  \\    ",
-            "(_) |   |      ",
-            "  \\  --- _/    ",
-            "     ---(_)    ",
-        ]
-    } else if os_lower.contains("debian") {
-        vec![
-            "  _____  ",
-            " /  __ \\ ",
-            "|  /    |",
-            "|  \\___- ",
-            " -_      ",
-            "   --_   ",
-        ]
-    } else if os_lower.contains("fedora") {
-        vec![
-            "      _____    ",
-            "     /   __)\\  ",
-            "     |  /  \\ \\ ",
-            "  ___|  |__/ / ",
-            " / (_    _)_/  ",
-            "/ /  |  |      ",
-        ]
-    } else if os_lower.contains("macos") || os_lower.contains("darwin") {
-        vec![
-            "       .:'     ",
-            "    __ :'__    ",
-            " .'`  `-'  ``. ",
-            ":          .-' ",
-            ":         :    ",
-            " :         `-; ",
-        ]
-    } else {
-        vec![
-            "   ______   ",
-            "  /      \\  ",
-            " |  ◉  ◉  | ",
-            " |    >   | ",
-            " |  \\___/ | ",
-            "  \\______/  ",
-        ]
-    }
-    .into_iter()
-    .map(|s| s.to_string())
-    .collect()
-}
-
-fn display_side_by_side(logo: &[String], info: &[String]) -> usize {
-    let logo_width = logo.iter().map(|s| s.len()).max().unwrap_or(0);
-    let max_lines = logo.len().max(info.len());
-
-    for i in 0..max_lines {
-        let logo_line = if i < logo.len() {
-            format!("{:width$}", colorize(&logo[i], BLUE), width = logo_width + 10)
-        } else {
-            " ".repeat(logo_width + 4)
-        };
-
-        let info_line = if i < info.len() { &info[i] } else { "" };
-
-        println!("{}  {}", logo_line, info_line);
+            } 
+        } 
     }
     
-    max_lines
+    // Method 2: lspci for ALL GPUs
+    if let Ok(o) = Command::new("lspci").output() { 
+        if let Ok(s) = String::from_utf8(o.stdout) {
+            for l in s.lines() { 
+                if l.contains("VGA compatible controller") || l.contains("3D controller") || l.contains("Display controller") { 
+                    // Extract the GPU name after the last colon
+                    if let Some(after_colon) = l.split(": ").last() {
+                        let mut gpu_name = after_colon.trim().to_string();
+                        
+                        // Remove revision info like (rev 04)
+                        if let Some(rev_pos) = gpu_name.find(" (rev ") {
+                            gpu_name = gpu_name[..rev_pos].to_string();
+                        }
+                        
+                        // Clean up the name
+                        gpu_name = gpu_name
+                            .replace("Corporation ", "")
+                            .replace("Integrated Graphics Controller", "Graphics")
+                            .trim()
+                            .to_string();
+                        
+                        // Skip if it's a duplicate of what nvidia-smi found
+                        let normalized = gpu_name.to_lowercase();
+                        let is_nvidia_duplicate = gpus.iter().any(|g| {
+                            let g_lower = g.to_lowercase();
+                            g_lower.contains("nvidia") && normalized.contains("nvidia") &&
+                            (g_lower.contains(&normalized.replace("nvidia ", "")) || 
+                             normalized.contains(&g_lower.replace("nvidia ", "")))
+                        });
+                        
+                        if !is_nvidia_duplicate && seen_names.insert(normalized) {
+                            gpus.push(gpu_name);
+                        }
+                    }
+                } 
+            } 
+        } 
+    }
+    
+    if gpus.is_empty() { 
+        gpus.push("No GPU detected".to_string()); 
+    }
+    
+    gpus
+}
+fn get_memory_swap() -> (String, String) {
+    let (mut mt, mut ma, mut st, mut sf) = (None, None, None, None);
+    if let Ok(c) = fs::read_to_string("/proc/meminfo") { for l in c.lines() {
+        if mt.is_none() && l.starts_with("MemTotal:") { mt = l.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok()); }
+        else if ma.is_none() && l.starts_with("MemAvailable:") { ma = l.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok()); }
+        else if st.is_none() && l.starts_with("SwapTotal:") { st = l.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok()); }
+        else if sf.is_none() && l.starts_with("SwapFree:") { sf = l.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok()); }
+        if mt.is_some() && ma.is_some() && st.is_some() && sf.is_some() { break; } } }
+    let mem = if let (Some(t), Some(a)) = (mt, ma) { let u = t - a;
+        format!("{:.1} GiB / {:.1} GiB", u as f64 / 1048576.0, t as f64 / 1048576.0) } else { "Unknown".to_string() };
+    let swap = if let (Some(t), Some(f)) = (st, sf) { if t > 0 { let u = t - f;
+        format!("{:.1} GiB / {:.1} GiB", u as f64 / 1048576.0, t as f64 / 1048576.0) } else { "0 B".to_string() } } else { "0 B".to_string() };
+    (mem, swap)
+}
+fn get_disk() -> String { cmd("df -h /").and_then(|o| o.lines().nth(1).map(|l| {
+    let p: Vec<&str> = l.split_whitespace().collect();
+    if p.len() >= 5 { format!("{} / {} ({})", p[2], p[1], p[4]) } else { "Unknown".to_string() } }))
+    .unwrap_or_else(|| "Unknown".to_string()) }
+fn get_lsblk() -> Vec<String> { cmd("lsblk -o NAME,SIZE,TYPE,MOUNTPOINT").map(|o| 
+    o.lines().skip(1).map(String::from).collect()).unwrap_or_default() }
+fn get_locale() -> String { std::env::var("LANG").or_else(|_| std::env::var("LC_ALL"))
+    .unwrap_or_else(|_| "Unknown".to_string()) }
+fn get_local_ip() -> String { cmd("hostname -I").map(|s| s.split_whitespace().next()
+    .unwrap_or("Unknown").to_string()).unwrap_or_else(|| "Unknown".to_string()) }
+fn get_public_ip() -> String { cmd("curl -s ifconfig.me").unwrap_or_else(|| "Unknown".to_string()) }
+fn get_battery() -> String { fs::read_dir("/sys/class/power_supply").ok().and_then(|d| {
+    for e in d.flatten() { let p = e.path(); if let Some(n) = p.file_name() {
+        if n.to_string_lossy().starts_with("BAT") {
+            let cap = fs::read_to_string(p.join("capacity")).ok()?.trim().to_string();
+            let stat = fs::read_to_string(p.join("status")).ok()?.trim().to_string();
+            return Some(format!("{}% ({})", cap, stat)); } } } None })
+    .unwrap_or_else(|| "Unknown".to_string()) }
+
+fn get_logo(os: &str) -> Vec<String> {
+    let o = os.to_lowercase();
+    if o.contains("arch") || o.contains("cachy") { 
+        vec!["      /\\      ", "     /  \\     ", "    /\\   \\    ",
+             "   /  \\   \\   ", "  /    \\   \\  ", " /______\\___\\ "] 
+    } else if o.contains("ubuntu") { 
+        vec!["         _     ", "     ---(_)    ", " _/  ---  \\    ",
+             "(_) |   |      ", "  \\  --- _/    ", "     ---(_)    "] 
+    } else if o.contains("debian") { 
+        vec!["  _____  ", " /  __ \\ ", "|  /    |", "|  \\___- ", " -_      ", "   --_   "] 
+    } else if o.contains("fedora") { 
+        vec!["      _____    ", "     /   __)\\  ", "     |  /  \\ \\ ",
+             "  ___|  |__/ / ", " / (_    _)_/  ", "/ /  |  |      "] 
+    } else { 
+        vec!["   ______   ", "  /      \\  ", " |  ◉  ◉  | ", 
+             " |    >   | ", " |  \\___/ | ", "  \\______/  "] 
+    }
+    .into_iter().map(|s| s.to_string()).collect()
+}
+
+fn cmd(c: &str) -> Option<String> { 
+    let parts: Vec<&str> = c.split_whitespace().collect();
+    Command::new(parts[0]).args(&parts[1..]).output().ok()
+        .and_then(|o| if o.status.success() { 
+            String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string()) 
+        } else { None }) 
+}
+
+fn get_cached(cache: &Arc<Mutex<Cache>>, key: &str, f: fn() -> String) -> String {
+    let mut c = cache.lock().unwrap(); 
+    if let Some(v) = c.get(key) { return v; }
+    let v = f(); 
+    c.set(key, v.clone()); 
+    v 
+}
+
+fn get_cached_vec(cache: &Arc<Mutex<Cache>>, key: &str, f: fn() -> Vec<String>) -> Vec<String> {
+    let mut c = cache.lock().unwrap(); 
+    if let Some(v) = c.get(key) { return v.split("||").map(String::from).collect(); }
+    let v = f(); 
+    c.set(key, v.join("||")); 
+    v 
 }
