@@ -28,7 +28,7 @@ cd rustfetch
 2. Build the project:
 
 ```bash
-rustc rustfetch.rs
+rustc -C opt-level=3 -C target-cpu=native -C lto=fat rustfetch.rs
 ```
 
 3. Run the binary:
