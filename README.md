@@ -80,9 +80,9 @@ This project is licensed under the MIT License idk why it just seems better. See
 
 ## Contributing
 
-Contributions are welcome! Feel free to fork and extend the project.
+Contributions are welcome! Feel free to fork and extend the project. Keep it sub 2000 lines and make it stay how it is with depencies i hate them with a passion. 
 
 ---
 
 ## Contact Me 
-Do it via issues like a normal person 
+Do it via issues like a normal person Or email me via reubenpercival14@gmail.com
