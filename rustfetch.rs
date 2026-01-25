@@ -1,46 +1,36 @@
 use std::{
-    fs, 
-    process::Command, 
-    thread, 
-    sync::{Arc, Mutex}, 
-    io::{self, Write}, 
-    collections::{HashMap, HashSet},
-    time::Duration,
+    fs, process::Command, thread, sync::{Arc, Mutex}, io::{self, Write},
+    collections::{HashMap, HashSet}, time::{Duration, SystemTime},
 };
 
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║                            CONFIGURATION                                  ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
+// ════════════════════════════════════════════════════════════════════════════
+//                              CONFIGURATION
+// ════════════════════════════════════════════════════════════════════════════
 
 const PROGRESSIVE_DISPLAY: bool = true;
 const USE_COLOR: bool = true;
 const CACHE_ENABLED: bool = true;
 const CACHE_FILE: &str = "/tmp/rustfetch_cache";
+const PROGRESS_BAR_WIDTH: usize = 20;
 
-// Display toggles
 const SHOW_USER_HOST: bool = true;
 const SHOW_OS: bool = true;
 const SHOW_KERNEL: bool = true;
 const SHOW_UPTIME: bool = true;
+const SHOW_BOOT_TIME: bool = true;
 const SHOW_PACKAGES: bool = true;
 const SHOW_SHELL: bool = true;
 const SHOW_DE: bool = true;
 const SHOW_WM: bool = true;
-const SHOW_WM_THEME: bool = true;
 const SHOW_TERMINAL: bool = true;
 const SHOW_CPU: bool = true;
 const SHOW_GPU: bool = true;
 const SHOW_MEMORY: bool = true;
 const SHOW_SWAP: bool = true;
 const SHOW_DISK: bool = true;
-const SHOW_DISK_DETAILED: bool = true;
-const SHOW_LOCALE: bool = false;
-const SHOW_LOCAL_IP: bool = true;
-const SHOW_PUBLIC_IP: bool = false;
 const SHOW_BATTERY: bool = true;
 const SHOW_COLORS: bool = true;
 
-// Color constants
 const C_RESET: &str = "\x1b[0m";
 const C_BOLD: &str = "\x1b[1m";
 const C_CYAN: &str = "\x1b[96m";
@@ -50,86 +40,46 @@ const C_BLUE: &str = "\x1b[94m";
 const C_MAGENTA: &str = "\x1b[95m";
 const C_RED: &str = "\x1b[91m";
 
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║                           END CONFIGURATION                               ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
+const KB_TO_GIB: f64 = 1048576.0;
 
-#[derive(Default)]
+// ════════════════════════════════════════════════════════════════════════════
+//                           DATA STRUCTURES
+// ════════════════════════════════════════════════════════════════════════════
+
+#[derive(Default, Clone)]
 struct Info {
-    user: Option<String>,
-    hostname: Option<String>,
-    os: Option<String>,
-    kernel: Option<String>,
-    uptime: Option<String>,
-    packages: Option<String>,
-    shell: Option<String>,
-    de: Option<String>,
-    wm: Option<String>,
-    wm_theme: Option<String>,
-    terminal: Option<String>,
-    cpu: Option<String>,
-    gpu: Option<Vec<String>>,
-    memory: Option<String>,
-    swap: Option<String>,
-    disk: Option<String>,
-    disk_detailed: Option<Vec<String>>,
-    locale: Option<String>,
-    local_ip: Option<String>,
-    public_ip: Option<String>,
-    battery: Option<String>,
+    user: Option<String>, hostname: Option<String>, os: Option<String>,
+    kernel: Option<String>, uptime: Option<String>, boot_time: Option<String>,
+    packages: Option<String>, shell: Option<String>, de: Option<String>, 
+    wm: Option<String>, terminal: Option<String>, cpu: Option<String>,
+    gpu: Option<Vec<String>>, memory: Option<(f64, f64)>, swap: Option<(f64, f64)>,
+    disk: Option<(f64, f64)>, battery: Option<(u8, String)>,
 }
 
-struct Cache {
-    data: HashMap<String, String>,
-}
+struct Cache { data: HashMap<String, String> }
 
 impl Cache {
     fn load() -> Self {
-        if !CACHE_ENABLED {
-            return Cache {
-                data: HashMap::new(),
-            };
-        }
-        
-        let data = fs::read_to_string(CACHE_FILE)
-            .ok()
-            .map(|content| {
-                content
-                    .lines()
-                    .filter_map(|line| {
-                        line.split_once('=')
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                    })
-                    .collect()
-            })
+        if !CACHE_ENABLED { return Cache { data: HashMap::new() }; }
+        let data = fs::read_to_string(CACHE_FILE).ok()
+            .map(|c| c.lines().filter_map(|l| l.split_once('=')
+                .map(|(k, v)| (k.to_string(), v.to_string()))).collect())
             .unwrap_or_default();
-        
         Cache { data }
     }
-    
-    fn get(&self, key: &str) -> Option<String> {
-        self.data.get(key).cloned()
-    }
-    
-    fn set(&mut self, key: &str, value: String) {
-        self.data.insert(key.to_string(), value);
-    }
-    
+    fn get(&self, key: &str) -> Option<String> { self.data.get(key).cloned() }
+    fn set(&mut self, key: &str, value: String) { self.data.insert(key.to_string(), value); }
     fn save(&self) {
-        if !CACHE_ENABLED {
-            return;
-        }
-        
-        let content: String = self
-            .data
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join("\n");
-        
+        if !CACHE_ENABLED { return; }
+        let content: String = self.data.iter()
+            .map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("\n");
         let _ = fs::write(CACHE_FILE, content);
     }
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+//                              MAIN LOGIC
+// ════════════════════════════════════════════════════════════════════════════
 
 fn main() {
     let cache = Arc::new(Mutex::new(Cache::load()));
@@ -137,940 +87,513 @@ fn main() {
     let logo = Arc::new(Mutex::new(Vec::new()));
 
     if PROGRESSIVE_DISPLAY {
-        progressive_display(Arc::clone(&cache), Arc::clone(&info), Arc::clone(&logo));
+        progressive_display(cache, info, logo);
     } else {
-        static_display(Arc::clone(&cache), Arc::clone(&info), Arc::clone(&logo));
+        static_display(cache, info, logo);
     }
 }
 
-fn progressive_display(
-    cache: Arc<Mutex<Cache>>,
-    info: Arc<Mutex<Info>>,
-    logo: Arc<Mutex<Vec<String>>>,
-) {
-    let info_clone = Arc::clone(&info);
-    let logo_clone = Arc::clone(&logo);
+fn progressive_display(cache: Arc<Mutex<Cache>>, info: Arc<Mutex<Info>>, logo: Arc<Mutex<Vec<String>>>) {
+    let (info_c, logo_c) = (Arc::clone(&info), Arc::clone(&logo));
     
     let display_thread = thread::spawn(move || {
         let mut last_lines = 0;
         loop {
-            thread::sleep(Duration::from_millis(20));
-            
-            let info_guard = info_clone.lock().unwrap();
-            let logo_guard = logo_clone.lock().unwrap();
-            
-            if last_lines > 0 {
-                print!("\x1b[{}A\x1b[J", last_lines);
-            }
-            
-            last_lines = display_info(&info_guard, &logo_guard);
-            io::stdout().flush().unwrap();
-            
-            if check_loaded(&info_guard) {
-                break;
+            thread::sleep(Duration::from_millis(16));
+            if let (Ok(i), Ok(l)) = (info_c.lock(), logo_c.lock()) {
+                if last_lines > 0 { print!("\x1b[{}A\x1b[J", last_lines); }
+                last_lines = display_info(&i, &l);
+                let _ = io::stdout().flush();
+                if check_loaded(&i) { break; }
             }
         }
     });
 
-    let mut handles = vec![spawn_basic_info(&info, &cache, &logo)];
-    
-    if SHOW_KERNEL {
-        handles.push(spawn_kernel(&info, &cache));
-    }
-    if SHOW_UPTIME {
-        handles.push(spawn_uptime(&info));
-    }
-    if SHOW_PACKAGES {
-        handles.push(spawn_packages(&info, &cache));
-    }
-    if SHOW_SHELL || SHOW_DE || SHOW_WM || SHOW_WM_THEME || SHOW_TERMINAL {
-        handles.push(spawn_shell_environment(&info, &cache));
-    }
-    if SHOW_CPU {
-        handles.push(spawn_cpu(&info, &cache));
-    }
-    if SHOW_GPU {
-        handles.push(spawn_gpu(&info, &cache));
-    }
-    if SHOW_MEMORY || SHOW_SWAP {
-        handles.push(spawn_memory(&info));
-    }
-    if SHOW_DISK {
-        handles.push(spawn_disk(&info));
-    }
-    if SHOW_DISK_DETAILED {
-        handles.push(spawn_disk_detailed(&info));
-    }
-    if SHOW_LOCALE {
-        handles.push(spawn_locale(&info));
-    }
-    if SHOW_LOCAL_IP {
-        handles.push(spawn_local_ip(&info));
-    }
-    if SHOW_PUBLIC_IP {
-        handles.push(spawn_public_ip(&info));
-    }
-    if SHOW_BATTERY {
-        handles.push(spawn_battery(&info));
-    }
+    let handles = vec![
+        spawn(&info, &cache, &logo, gather_basic_info),
+        spawn(&info, &cache, &logo, gather_system_info),
+        spawn(&info, &cache, &logo, gather_hardware_info),
+        spawn(&info, &cache, &logo, gather_resources),
+    ];
 
-    for handle in handles {
-        let _ = handle.join();
-    }
-    
-    cache.lock().unwrap().save();
+    for h in handles { let _ = h.join(); }
+    if let Ok(c) = cache.lock() { c.save(); }
     let _ = display_thread.join();
 }
 
-fn static_display(
-    cache: Arc<Mutex<Cache>>,
-    info: Arc<Mutex<Info>>,
-    logo: Arc<Mutex<Vec<String>>>,
-) {
-    let cache_guard = cache.lock().unwrap();
-    
-    let user = get_user();
-    let host = get_cached_static(&cache_guard, "host", get_hostname);
-    let os = get_cached_static(&cache_guard, "os", get_os);
-    
-    *logo.lock().unwrap() = get_logo(&os);
-    
-    let mut info_guard = info.lock().unwrap();
-    info_guard.user = Some(user);
-    info_guard.hostname = Some(host);
-    info_guard.os = Some(os);
-    
+fn static_display(cache: Arc<Mutex<Cache>>, info: Arc<Mutex<Info>>, logo: Arc<Mutex<Vec<String>>>) {
+    if let Ok(c) = cache.lock() {
+        if let Ok(mut i) = info.lock() {
+            gather_basic_info(&mut i, &c);
+            gather_system_info(&mut i, &c);
+            gather_hardware_info(&mut i, &c);
+            gather_resources(&mut i, &c);
+            
+            if let Ok(mut l) = logo.lock() {
+                *l = get_logo(i.os.as_ref().map(|s| s.as_str()).unwrap_or(""));
+            }
+        }
+        c.save();
+    }
+    if let (Ok(i), Ok(l)) = (info.lock(), logo.lock()) { display_info(&i, &l); }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//                           INFO GATHERERS
+// ════════════════════════════════════════════════════════════════════════════
+
+fn gather_basic_info(info: &mut Info, cache: &Cache) {
+    info.user = Some(std::env::var("USER").or_else(|_| std::env::var("USERNAME"))
+        .unwrap_or_else(|_| "unknown".to_string()));
+    info.hostname = Some(cache_or(&cache, "host", || 
+        fs::read_to_string("/etc/hostname").ok()
+            .or_else(|| run("hostname -s"))
+            .unwrap_or_else(|| "unknown".to_string()).trim().to_string()));
+    info.os = Some(cache_or(&cache, "os", || 
+        fs::read_to_string("/etc/os-release").ok()
+            .and_then(|c| c.lines().find_map(|l| l.strip_prefix("PRETTY_NAME="))
+                .map(|s| s.trim_matches('"').to_string()))
+            .unwrap_or_else(|| "Unknown OS".to_string())));
+}
+
+fn gather_system_info(info: &mut Info, cache: &Cache) {
     if SHOW_KERNEL {
-        info_guard.kernel = Some(get_cached_static(&cache_guard, "kernel", get_kernel));
+        info.kernel = Some(cache_or(&cache, "kernel", || run("uname -r").unwrap_or_else(|| "Unknown".to_string())));
     }
     if SHOW_UPTIME {
-        info_guard.uptime = Some(get_uptime());
+        info.uptime = Some(get_uptime());
+    }
+    if SHOW_BOOT_TIME {
+        info.boot_time = Some(get_boot_time());
     }
     if SHOW_PACKAGES {
-        info_guard.packages = Some(get_cached_static(&cache_guard, "pkgs", get_packages));
+        info.packages = Some(cache_or(&cache, "pkgs", get_packages));
     }
     if SHOW_SHELL {
-        info_guard.shell = Some(get_shell());
+        info.shell = Some(std::env::var("SHELL").ok()
+            .and_then(|s| s.rsplit('/').next().map(String::from))
+            .unwrap_or_else(|| "unknown".to_string()));
     }
     if SHOW_DE {
-        info_guard.de = Some(get_de());
+        info.de = Some(std::env::var("XDG_CURRENT_DESKTOP")
+            .or_else(|_| std::env::var("DESKTOP_SESSION"))
+            .unwrap_or_else(|_| "Unknown".to_string()));
     }
     if SHOW_WM {
-        info_guard.wm = Some(get_cached_static(&cache_guard, "wm", get_wm));
-    }
-    if SHOW_WM_THEME {
-        info_guard.wm_theme = Some(get_wm_theme());
+        info.wm = Some(cache_or(&cache, "wm", get_wm));
     }
     if SHOW_TERMINAL {
-        info_guard.terminal = Some(get_terminal());
+        info.terminal = Some(std::env::var("TERM_PROGRAM")
+            .or_else(|_| std::env::var("TERMINAL"))
+            .unwrap_or_else(|_| "Unknown".to_string()));
     }
+}
+
+fn gather_hardware_info(info: &mut Info, cache: &Cache) {
     if SHOW_CPU {
-        info_guard.cpu = Some(get_cached_static(&cache_guard, "cpu", get_cpu));
+        info.cpu = Some(cache_or(&cache, "cpu", get_cpu));
     }
     if SHOW_GPU {
-        info_guard.gpu = Some(get_cached_vec_static(&cache_guard, "gpu", get_gpu));
+        info.gpu = Some(cache_or_vec(&cache, "gpu", get_gpu));
     }
+}
+
+fn gather_resources(info: &mut Info, _cache: &Cache) {
     if SHOW_MEMORY || SHOW_SWAP {
         let (mem, swap) = get_memory_swap();
-        if SHOW_MEMORY {
-            info_guard.memory = Some(mem);
-        }
-        if SHOW_SWAP {
-            info_guard.swap = Some(swap);
-        }
+        if SHOW_MEMORY { info.memory = mem; }
+        if SHOW_SWAP { info.swap = swap; }
     }
     if SHOW_DISK {
-        info_guard.disk = Some(get_disk());
-    }
-    if SHOW_DISK_DETAILED {
-        info_guard.disk_detailed = Some(get_lsblk());
-    }
-    if SHOW_LOCALE {
-        info_guard.locale = Some(get_locale());
-    }
-    if SHOW_LOCAL_IP {
-        info_guard.local_ip = Some(get_local_ip());
-    }
-    if SHOW_PUBLIC_IP {
-        info_guard.public_ip = Some(get_public_ip());
+        info.disk = get_disk();
     }
     if SHOW_BATTERY {
-        info_guard.battery = Some(get_battery());
+        info.battery = get_battery();
     }
-    
-    drop(info_guard);
-    drop(cache_guard);
-    
-    cache.lock().unwrap().save();
-    display_info(&info.lock().unwrap(), &logo.lock().unwrap());
 }
 
-// Thread spawning helpers
-fn spawn_basic_info(
-    info: &Arc<Mutex<Info>>,
-    cache: &Arc<Mutex<Cache>>,
-    logo: &Arc<Mutex<Vec<String>>>,
-) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    let cache = Arc::clone(cache);
-    let logo = Arc::clone(logo);
-    
-    thread::spawn(move || {
-        let user = get_user();
-        let host = get_cached(&cache, "host", get_hostname);
-        let os = get_cached(&cache, "os", get_os);
-        
-        let mut info_guard = info.lock().unwrap();
-        info_guard.user = Some(user);
-        info_guard.hostname = Some(host);
-        info_guard.os = Some(os.clone());
-        drop(info_guard);
-        
-        *logo.lock().unwrap() = get_logo(&os);
-    })
-}
+// ════════════════════════════════════════════════════════════════════════════
+//                           HELPER FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════
 
-fn spawn_kernel(info: &Arc<Mutex<Info>>, cache: &Arc<Mutex<Cache>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    let cache = Arc::clone(cache);
+fn spawn<F>(i: &Arc<Mutex<Info>>, c: &Arc<Mutex<Cache>>, l: &Arc<Mutex<Vec<String>>>, f: F) 
+    -> thread::JoinHandle<()>
+where F: FnOnce(&mut Info, &Cache) + Send + 'static {
+    let (i, c, l) = (Arc::clone(i), Arc::clone(c), Arc::clone(l));
     thread::spawn(move || {
-        info.lock().unwrap().kernel = Some(get_cached(&cache, "kernel", get_kernel));
-    })
-}
-
-fn spawn_uptime(info: &Arc<Mutex<Info>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    thread::spawn(move || {
-        info.lock().unwrap().uptime = Some(get_uptime());
-    })
-}
-
-fn spawn_packages(info: &Arc<Mutex<Info>>, cache: &Arc<Mutex<Cache>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    let cache = Arc::clone(cache);
-    thread::spawn(move || {
-        info.lock().unwrap().packages = Some(get_cached(&cache, "pkgs", get_packages));
-    })
-}
-
-fn spawn_shell_environment(
-    info: &Arc<Mutex<Info>>,
-    cache: &Arc<Mutex<Cache>>,
-) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    let cache = Arc::clone(cache);
-    thread::spawn(move || {
-        let mut info_guard = info.lock().unwrap();
-        if SHOW_SHELL {
-            info_guard.shell = Some(get_shell());
-        }
-        if SHOW_DE {
-            info_guard.de = Some(get_de());
-        }
-        if SHOW_WM {
-            info_guard.wm = Some(get_cached(&cache, "wm", get_wm));
-        }
-        if SHOW_WM_THEME {
-            info_guard.wm_theme = Some(get_wm_theme());
-        }
-        if SHOW_TERMINAL {
-            info_guard.terminal = Some(get_terminal());
+        if let (Ok(mut info), Ok(cache)) = (i.lock(), c.lock()) {
+            f(&mut info, &cache);
+            if info.os.is_some() {
+                if let Ok(mut logo) = l.lock() {
+                    *logo = get_logo(info.os.as_ref().unwrap());
+                }
+            }
         }
     })
 }
 
-fn spawn_cpu(info: &Arc<Mutex<Info>>, cache: &Arc<Mutex<Cache>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    let cache = Arc::clone(cache);
-    thread::spawn(move || {
-        info.lock().unwrap().cpu = Some(get_cached(&cache, "cpu", get_cpu));
-    })
+fn check_loaded(i: &Info) -> bool {
+    i.user.is_some() && i.hostname.is_some() && i.os.is_some()
+        && (!SHOW_KERNEL || i.kernel.is_some())
+        && (!SHOW_UPTIME || i.uptime.is_some())
+        && (!SHOW_BOOT_TIME || i.boot_time.is_some())
+        && (!SHOW_PACKAGES || i.packages.is_some())
+        && (!SHOW_SHELL || i.shell.is_some())
+        && (!SHOW_DE || i.de.is_some())
+        && (!SHOW_WM || i.wm.is_some())
+        && (!SHOW_TERMINAL || i.terminal.is_some())
+        && (!SHOW_CPU || i.cpu.is_some())
+        && (!SHOW_GPU || i.gpu.is_some())
+        && (!SHOW_MEMORY || i.memory.is_some())
+        && (!SHOW_SWAP || i.swap.is_some())
+        && (!SHOW_DISK || i.disk.is_some())
+        && (!SHOW_BATTERY || i.battery.is_some())
 }
 
-fn spawn_gpu(info: &Arc<Mutex<Info>>, cache: &Arc<Mutex<Cache>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    let cache = Arc::clone(cache);
-    thread::spawn(move || {
-        info.lock().unwrap().gpu = Some(get_cached_vec(&cache, "gpu", get_gpu));
-    })
+fn progress_bar(used: f64, total: f64, color: &str) -> String {
+    let pct = if total > 0.0 { (used / total * 100.0).min(100.0) } else { 0.0 };
+    let filled = ((pct / 100.0) * PROGRESS_BAR_WIDTH as f64) as usize;
+    let empty = PROGRESS_BAR_WIDTH - filled;
+    format!("{}{:.1}/{:.1} GiB {}[{}{}{}] {:.0}%{}",
+        color, used, total, C_RESET,
+        colorize(&"█".repeat(filled), color),
+        colorize(&"░".repeat(empty), C_RESET),
+        C_RESET, pct, C_RESET)
 }
 
-fn spawn_memory(info: &Arc<Mutex<Info>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    thread::spawn(move || {
-        let (mem, swap) = get_memory_swap();
-        let mut info_guard = info.lock().unwrap();
-        if SHOW_MEMORY {
-            info_guard.memory = Some(mem);
-        }
-        if SHOW_SWAP {
-            info_guard.swap = Some(swap);
-        }
-    })
+fn battery_bar(level: u8, status: &str, color: &str) -> String {
+    let filled = ((level as f64 / 100.0) * PROGRESS_BAR_WIDTH as f64) as usize;
+    let empty = PROGRESS_BAR_WIDTH - filled;
+    format!("{}%{} ({}) {}[{}{}{}]{}",
+        level, C_RESET, status, C_RESET,
+        colorize(&"█".repeat(filled), color),
+        colorize(&"░".repeat(empty), C_RESET),
+        C_RESET, C_RESET)
 }
 
-fn spawn_disk(info: &Arc<Mutex<Info>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    thread::spawn(move || {
-        info.lock().unwrap().disk = Some(get_disk());
-    })
-}
-
-fn spawn_disk_detailed(info: &Arc<Mutex<Info>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    thread::spawn(move || {
-        info.lock().unwrap().disk_detailed = Some(get_lsblk());
-    })
-}
-
-fn spawn_locale(info: &Arc<Mutex<Info>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    thread::spawn(move || {
-        info.lock().unwrap().locale = Some(get_locale());
-    })
-}
-
-fn spawn_local_ip(info: &Arc<Mutex<Info>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    thread::spawn(move || {
-        info.lock().unwrap().local_ip = Some(get_local_ip());
-    })
-}
-
-fn spawn_public_ip(info: &Arc<Mutex<Info>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    thread::spawn(move || {
-        info.lock().unwrap().public_ip = Some(get_public_ip());
-    })
-}
-
-fn spawn_battery(info: &Arc<Mutex<Info>>) -> thread::JoinHandle<()> {
-    let info = Arc::clone(info);
-    thread::spawn(move || {
-        info.lock().unwrap().battery = Some(get_battery());
-    })
-}
-
-fn check_loaded(info: &Info) -> bool {
-    info.user.is_some()
-        && info.hostname.is_some()
-        && info.os.is_some()
-        && (!SHOW_KERNEL || info.kernel.is_some())
-        && (!SHOW_UPTIME || info.uptime.is_some())
-        && (!SHOW_PACKAGES || info.packages.is_some())
-        && (!SHOW_SHELL || info.shell.is_some())
-        && (!SHOW_DE || info.de.is_some())
-        && (!SHOW_WM || info.wm.is_some())
-        && (!SHOW_WM_THEME || info.wm_theme.is_some())
-        && (!SHOW_TERMINAL || info.terminal.is_some())
-        && (!SHOW_CPU || info.cpu.is_some())
-        && (!SHOW_GPU || info.gpu.is_some())
-        && (!SHOW_MEMORY || info.memory.is_some())
-        && (!SHOW_SWAP || info.swap.is_some())
-        && (!SHOW_DISK || info.disk.is_some())
-        && (!SHOW_DISK_DETAILED || info.disk_detailed.is_some())
-        && (!SHOW_LOCALE || info.locale.is_some())
-        && (!SHOW_LOCAL_IP || info.local_ip.is_some())
-        && (!SHOW_PUBLIC_IP || info.public_ip.is_some())
-        && (!SHOW_BATTERY || info.battery.is_some())
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::new();
+    let mut in_escape = false;
+    for ch in s.chars() {
+        if ch == '\x1b' { in_escape = true; }
+        else if in_escape && ch == 'm' { in_escape = false; }
+        else if !in_escape { result.push(ch); }
+    }
+    result
 }
 
 fn display_info(info: &Info, logo: &[String]) -> usize {
     let mut lines = Vec::new();
     
-    if let (Some(user), Some(host)) = (&info.user, &info.hostname) {
-        lines.push(format!(
-            "{}{}{}",
-            colorize(user, C_BOLD),
-            colorize("@", C_RESET),
-            colorize(host, C_BOLD)
-        ));
-        lines.push("─".repeat(user.len() + host.len() + 1));
+    if let (Some(u), Some(h)) = (&info.user, &info.hostname) {
+        lines.push(format!("{}{}{}", colorize(u, C_BOLD), colorize("@", C_RESET), colorize(h, C_BOLD)));
+        lines.push("─".repeat(u.len() + h.len() + 1));
     }
     
-    add_info_line(&mut lines, SHOW_OS, &info.os, "OS", C_CYAN);
-    add_info_line(&mut lines, SHOW_KERNEL, &info.kernel, "Kernel", C_CYAN);
-    add_info_line(&mut lines, SHOW_UPTIME, &info.uptime, "Uptime", C_CYAN);
-    add_info_line(&mut lines, SHOW_PACKAGES, &info.packages, "Packages", C_CYAN);
-    add_info_line(&mut lines, SHOW_SHELL, &info.shell, "Shell", C_CYAN);
-    add_filtered_line(&mut lines, SHOW_DE, &info.de, "DE", C_CYAN);
-    add_filtered_line(&mut lines, SHOW_WM, &info.wm, "WM", C_CYAN);
-    add_filtered_line(&mut lines, SHOW_WM_THEME, &info.wm_theme, "Theme", C_CYAN);
-    add_filtered_line(&mut lines, SHOW_TERMINAL, &info.terminal, "Terminal", C_CYAN);
-    add_info_line(&mut lines, SHOW_CPU, &info.cpu, "CPU", C_GREEN);
+    add(&mut lines, SHOW_OS, &info.os, "OS", C_CYAN);
+    add(&mut lines, SHOW_KERNEL, &info.kernel, "Kernel", C_CYAN);
+    add(&mut lines, SHOW_UPTIME, &info.uptime, "Uptime", C_CYAN);
+    add(&mut lines, SHOW_BOOT_TIME, &info.boot_time, "Boot Time", C_GREEN);
+    add(&mut lines, SHOW_PACKAGES, &info.packages, "Packages", C_CYAN);
+    add(&mut lines, SHOW_SHELL, &info.shell, "Shell", C_CYAN);
+    add_filt(&mut lines, SHOW_DE, &info.de, "DE", C_CYAN);
+    add_filt(&mut lines, SHOW_WM, &info.wm, "WM", C_CYAN);
+    add_filt(&mut lines, SHOW_TERMINAL, &info.terminal, "Terminal", C_CYAN);
+    add(&mut lines, SHOW_CPU, &info.cpu, "CPU", C_GREEN);
     
     if SHOW_GPU {
         if let Some(gpus) = &info.gpu {
-            for (idx, gpu) in gpus.iter().enumerate() {
-                if idx == 0 {
-                    lines.push(format!("{}: {}", colorize("GPU", C_MAGENTA), gpu));
-                } else {
-                    lines.push(format!("    {}", gpu));
-                }
+            for (i, g) in gpus.iter().enumerate() {
+                lines.push(if i == 0 { format!("{}: {}", colorize("GPU", C_MAGENTA), g) }
+                    else { format!("    {}", g) });
             }
         }
     }
     
-    add_info_line(&mut lines, SHOW_MEMORY, &info.memory, "Memory", C_YELLOW);
+    if SHOW_MEMORY {
+        if let Some((used, total)) = info.memory {
+            lines.push(format!("{}: {}", colorize("Memory", C_YELLOW), 
+                progress_bar(used, total, C_YELLOW)));
+        }
+    }
     
     if SHOW_SWAP {
-        if let Some(swap) = &info.swap {
-            if swap != "0 B" {
-                lines.push(format!("{}: {}", colorize("Swap", C_YELLOW), swap));
+        if let Some((used, total)) = info.swap {
+            if total > 0.0 {
+                lines.push(format!("{}: {}", colorize("Swap", C_YELLOW), 
+                    progress_bar(used, total, C_YELLOW)));
             }
         }
     }
     
-    add_info_line(&mut lines, SHOW_DISK, &info.disk, "Disk (/)", C_BLUE);
-    
-    if SHOW_DISK_DETAILED {
-        if let Some(disks) = &info.disk_detailed {
-            for (idx, disk) in disks.iter().enumerate() {
-                if idx == 0 {
-                    lines.push(format!("{}: {}", colorize("Disks", C_BLUE), disk));
-                } else {
-                    lines.push(format!("       {}", disk));
-                }
-            }
+    if SHOW_DISK {
+        if let Some((used, total)) = info.disk {
+            lines.push(format!("{}: {}", colorize("Disk (/)", C_BLUE), 
+                progress_bar(used, total, C_BLUE)));
         }
     }
     
-    add_filtered_line(&mut lines, SHOW_LOCALE, &info.locale, "Locale", C_CYAN);
-    add_filtered_line(&mut lines, SHOW_LOCAL_IP, &info.local_ip, "Local IP", C_GREEN);
-    add_filtered_line(&mut lines, SHOW_PUBLIC_IP, &info.public_ip, "Public IP", C_GREEN);
-    add_filtered_line(&mut lines, SHOW_BATTERY, &info.battery, "Battery", C_RED);
+    if SHOW_BATTERY {
+        if let Some((level, status)) = &info.battery {
+            let color = if *level > 50 { C_GREEN } else if *level > 20 { C_YELLOW } else { C_RED };
+            lines.push(format!("{}: {}", colorize("Battery", color), 
+                battery_bar(*level, status, color)));
+        }
+    }
     
     if SHOW_COLORS {
         lines.push(String::new());
-        lines.push(format!(
-            "{}███{}███{}███{}███{}███{}███{}███{}███{}",
+        lines.push(format!("{}███{}███{}███{}███{}███{}███{}███{}███{}",
             "\x1b[40m", "\x1b[41m", "\x1b[42m", "\x1b[43m",
-            "\x1b[44m", "\x1b[45m", "\x1b[46m", "\x1b[47m", C_RESET
-        ));
+            "\x1b[44m", "\x1b[45m", "\x1b[46m", "\x1b[47m", C_RESET));
     }
     
-    let logo_width = logo.iter().map(|s| s.chars().count()).max().unwrap_or(0);
+    let logo_width = logo.iter().map(|s| strip_ansi(s).chars().count()).max().unwrap_or(0);
     let max_lines = logo.len().max(lines.len());
     
     for idx in 0..max_lines {
         let logo_line = if idx < logo.len() {
-            format!("{:width$}", colorize(&logo[idx], C_BLUE), width = logo_width + 10)
-        } else {
-            " ".repeat(logo_width + 4)
-        };
+            let stripped_len = strip_ansi(&logo[idx]).chars().count();
+            let padding = logo_width.saturating_sub(stripped_len);
+            format!("{}{}", colorize(&logo[idx], C_BLUE), " ".repeat(padding))
+        } else { " ".repeat(logo_width) };
         
-        let info_line = if idx < lines.len() {
-            &lines[idx]
-        } else {
-            ""
-        };
-        
+        let info_line = if idx < lines.len() { &lines[idx] } else { "" };
         println!("{}  {}", logo_line, info_line);
     }
-    
     max_lines
 }
 
-fn add_info_line(lines: &mut Vec<String>, show: bool, value: &Option<String>, label: &str, color: &str) {
-    if show {
-        if let Some(val) = value {
-            lines.push(format!("{}: {}", colorize(label, color), val));
-        }
-    }
+fn add(lines: &mut Vec<String>, show: bool, val: &Option<String>, label: &str, color: &str) {
+    if show { if let Some(v) = val { lines.push(format!("{}: {}", colorize(label, color), v)); } }
 }
 
-fn add_filtered_line(lines: &mut Vec<String>, show: bool, value: &Option<String>, label: &str, color: &str) {
-    if show {
-        if let Some(val) = value {
-            if val != "Unknown" {
-                lines.push(format!("{}: {}", colorize(label, color), val));
-            }
-        }
-    }
+fn add_filt(lines: &mut Vec<String>, show: bool, val: &Option<String>, label: &str, color: &str) {
+    if show { if let Some(v) = val { if v != "Unknown" { 
+        lines.push(format!("{}: {}", colorize(label, color), v)); } } }
 }
 
-#[inline(always)]
 fn colorize(text: &str, color: &str) -> String {
-    if USE_COLOR {
-        format!("{}{}{}", color, text, C_RESET)
-    } else {
-        text.to_string()
-    }
+    if USE_COLOR { format!("{}{}{}", color, text, C_RESET) } else { text.to_string() }
 }
 
-#[inline(always)]
-fn get_user() -> String {
-    std::env::var("USER")
-        .or_else(|_| std::env::var("USERNAME"))
-        .unwrap_or_else(|_| "unknown".to_string())
+fn cache_or<F: Fn() -> String>(cache: &Cache, key: &str, f: F) -> String {
+    cache.get(key).unwrap_or_else(f)
 }
 
-fn get_hostname() -> String {
-    fs::read_to_string("/etc/hostname")
-        .or_else(|_| run_command("hostname"))
-        .unwrap_or_else(|_| "unknown".to_string())
-        .trim()
-        .to_string()
+fn cache_or_vec<F: Fn() -> Vec<String>>(cache: &Cache, key: &str, f: F) -> Vec<String> {
+    cache.get(key).map(|v| v.split("||").map(String::from).collect()).unwrap_or_else(f)
 }
 
-fn get_os() -> String {
-    fs::read_to_string("/etc/os-release")
-        .ok()
-        .and_then(|content| {
-            content
-                .lines()
-                .find_map(|line| line.strip_prefix("PRETTY_NAME="))
-                .map(|s| s.trim_matches('"').to_string())
-        })
-        .unwrap_or_else(|| "Unknown OS".to_string())
+fn run(cmd: &str) -> Option<String> {
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    if parts.is_empty() { return None; }
+    Command::new(parts[0]).args(&parts[1..]).output().ok()
+        .and_then(|o| if o.status.success() { 
+            String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string()) 
+        } else { None })
 }
 
-fn get_kernel() -> String {
-    run_command("uname -r").unwrap_or_else(|_| "Unknown".to_string())
-}
+// ════════════════════════════════════════════════════════════════════════════
+//                        SYSTEM INFO FUNCTIONS
+// ════════════════════════════════════════════════════════════════════════════
 
 fn get_uptime() -> String {
-    fs::read_to_string("/proc/uptime")
-        .ok()
-        .and_then(|content| {
-            content
-                .split_whitespace()
-                .next()
-                .and_then(|s| s.parse::<f64>().ok())
-                .map(|seconds| {
-                    let days = (seconds / 86400.0) as u64;
-                    let hours = ((seconds % 86400.0) / 3600.0) as u64;
-                    let minutes = ((seconds % 3600.0) / 60.0) as u64;
-                    
-                    match (days, hours) {
-                        (d, h) if d > 0 => format!("{}d {}h {}m", d, h, minutes),
-                        (_, h) if h > 0 => format!("{}h {}m", h, minutes),
-                        _ => format!("{}m", minutes),
-                    }
-                })
-        })
+    fs::read_to_string("/proc/uptime").ok()
+        .and_then(|c| c.split_whitespace().next()
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(|sec| {
+                let (d, h, m) = ((sec / 86400.0) as u64, ((sec % 86400.0) / 3600.0) as u64, 
+                    ((sec % 3600.0) / 60.0) as u64);
+                match (d, h) {
+                    (d, h) if d > 0 => format!("{}d {}h {}m", d, h, m),
+                    (_, h) if h > 0 => format!("{}h {}m", h, m),
+                    _ => format!("{}m", m),
+                }
+            })).unwrap_or_else(|| "Unknown".to_string())
+}
+
+fn get_boot_time() -> String {
+    // Read btime from /proc/stat (boot timestamp in seconds since epoch)
+    fs::read_to_string("/proc/stat").ok()
+        .and_then(|c| c.lines()
+            .find(|l| l.starts_with("btime"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse::<i64>().ok())
+            .map(|ts| {
+                // Convert Unix timestamp to human-readable format
+                let secs_per_min = 60;
+                let secs_per_hour = 3600;
+                let secs_per_day = 86400;
+                
+                // Days since epoch
+                let days_since_epoch = ts / secs_per_day;
+                let remaining = ts % secs_per_day;
+                
+                // Hours, minutes, seconds
+                let hours = remaining / secs_per_hour;
+                let mins = (remaining % secs_per_hour) / secs_per_min;
+                let secs = remaining % secs_per_min;
+                
+                // Calculate year, month, day (simplified - assumes 1970 epoch)
+                let years_since_1970 = days_since_epoch / 365;
+                let year = 1970 + years_since_1970;
+                
+                // Approximate month and day (not perfect but good enough)
+                let days_in_year = days_since_epoch % 365;
+                let month = (days_in_year / 30) + 1;
+                let day = (days_in_year % 30) + 1;
+                
+                format!("{}-{:02}-{:02} {:02}:{:02}:{:02}", 
+                    year, month.min(12), day.min(31), hours, mins, secs)
+            }))
         .unwrap_or_else(|| "Unknown".to_string())
 }
 
 fn get_packages() -> String {
-    let count = try_count_packages("pacman", &["-Qq"])
-        .or_else(|| try_count_packages("dpkg", &["-l"]).map(|c| c.saturating_sub(5)))
-        .or_else(|| try_count_packages("rpm", &["-qa"]))
+    let count = try_count("pacman", &["-Qq"])
+        .or_else(|| try_count("dpkg", &["-l"]).map(|c| c.saturating_sub(5)))
+        .or_else(|| try_count("rpm", &["-qa"]))
+        .or_else(|| try_count("apk", &["list", "--installed"]))
         .unwrap_or(0);
-    
-    if count > 0 {
-        count.to_string()
-    } else {
-        "Unknown".to_string()
-    }
+    if count > 0 { count.to_string() } else { "Unknown".to_string() }
 }
 
-fn try_count_packages(cmd: &str, args: &[&str]) -> Option<usize> {
-    Command::new(cmd)
-        .args(args)
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
+fn try_count(cmd: &str, args: &[&str]) -> Option<usize> {
+    Command::new(cmd).args(args).output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.lines().count())
 }
 
-#[inline(always)]
-fn get_shell() -> String {
-    std::env::var("SHELL")
-        .ok()
-        .and_then(|s| s.rsplit('/').next().map(String::from))
-        .unwrap_or_else(|| "unknown".to_string())
-}
-
-fn get_de() -> String {
-    std::env::var("XDG_CURRENT_DESKTOP")
-        .or_else(|_| std::env::var("DESKTOP_SESSION"))
-        .unwrap_or_else(|_| {
-            if std::env::var("GNOME_DESKTOP_SESSION_ID").is_ok() {
-                "GNOME".to_string()
-            } else if std::env::var("KDE_FULL_SESSION").is_ok() {
-                "KDE".to_string()
-            } else {
-                "Unknown".to_string()
-            }
-        })
-}
-
 fn get_wm() -> String {
-    let window_managers = [
-        "hyprland", "sway", "i3", "bspwm", "awesome", "dwm", "openbox", "xmonad",
-    ];
-    
-    for wm in &window_managers {
-        if run_command(&format!("pgrep -x {}", wm)).is_ok() {
-            return wm.to_string();
-        }
+    for wm in &["hyprland", "sway", "i3", "bspwm", "awesome", "dwm", "openbox", "xmonad"] {
+        if run(&format!("pgrep -x {}", wm)).is_some() { return wm.to_string(); }
     }
-    
     "Unknown".to_string()
 }
 
-fn get_wm_theme() -> String {
-    std::env::var("GTK_THEME").ok().or_else(|| {
-        let home = std::env::var("HOME").ok()?;
-        let settings_path = format!("{}/.config/gtk-3.0/settings.ini", home);
-        
-        fs::read_to_string(settings_path)
-            .ok()
-            .and_then(|content| {
-                content
-                    .lines()
-                    .find_map(|line| line.strip_prefix("gtk-theme-name=").map(String::from))
-            })
-    })
-    .unwrap_or_else(|| "Unknown".to_string())
-}
-
-fn get_terminal() -> String {
-    std::env::var("TERM_PROGRAM")
-        .or_else(|_| std::env::var("TERMINAL"))
-        .unwrap_or_else(|_| "Unknown".to_string())
-}
-
 fn get_cpu() -> String {
-    fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|content| {
-            let mut model_name = None;
-            let mut core_count = 0;
-            
-            for line in content.lines() {
-                if model_name.is_none() && line.starts_with("model name") {
-                    model_name = line.split(':').nth(1).map(|s| {
-                        s.trim()
-                            .replace("(R)", "")
-                            .replace("(TM)", "")
-                            .split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    });
+    fs::read_to_string("/proc/cpuinfo").ok()
+        .and_then(|c| {
+            let mut model = None;
+            let mut cores = 0;
+            for l in c.lines() {
+                if model.is_none() && l.starts_with("model name") {
+                    model = l.split(':').nth(1).map(|s| s.trim()
+                        .replace("(R)", "").replace("(TM)", "")
+                        .split_whitespace().collect::<Vec<_>>().join(" "));
                 }
-                if line.starts_with("processor") {
-                    core_count += 1;
-                }
+                if l.starts_with("processor") { cores += 1; }
             }
-            
-            model_name.map(|name| format!("{} ({} cores)", name, core_count))
-        })
-        .unwrap_or_else(|| "Unknown CPU".to_string())
+            model.map(|m| format!("{} ({} cores)", m, cores))
+        }).unwrap_or_else(|| "Unknown CPU".to_string())
 }
 
 fn get_gpu() -> Vec<String> {
     let mut gpus = Vec::new();
-    let mut seen_names = HashSet::new();
+    let mut seen = HashSet::new();
     
-    // Method 1: NVIDIA GPUs via nvidia-smi
-    if let Ok(output) = Command::new("nvidia-smi")
-        .args(&["--query-gpu=gpu_name", "--format=csv,noheader"])
-        .output()
-    {
-        if output.status.success() {
-            if let Ok(stdout) = String::from_utf8(output.stdout) {
-                for line in stdout.lines().filter(|l| !l.is_empty()) {
-                    let gpu = line.trim().to_string();
-                    if seen_names.insert(gpu.to_lowercase()) {
-                        gpus.push(format!("NVIDIA {}", gpu));
-                    }
+    if let Ok(o) = Command::new("nvidia-smi").args(&["--query-gpu=gpu_name", "--format=csv,noheader"]).output() {
+        if o.status.success() {
+            if let Ok(s) = String::from_utf8(o.stdout) {
+                for l in s.lines().filter(|l| !l.is_empty()) {
+                    let gpu = format!("NVIDIA {}", l.trim());
+                    if seen.insert(gpu.to_lowercase()) { gpus.push(gpu); }
                 }
             }
         }
     }
     
-    // Method 2: lspci for ALL GPUs
-    if let Ok(output) = Command::new("lspci").output() {
-        if let Ok(stdout) = String::from_utf8(output.stdout) {
-            for line in stdout.lines() {
-                if line.contains("VGA compatible controller")
-                    || line.contains("3D controller")
-                    || line.contains("Display controller")
-                {
-                    if let Some(after_colon) = line.split(": ").last() {
-                        let mut gpu_name = after_colon.trim().to_string();
-                        
-                        // Remove revision info
-                        if let Some(rev_pos) = gpu_name.find(" (rev ") {
-                            gpu_name = gpu_name[..rev_pos].to_string();
-                        }
-                        
-                        // Clean up the name
-                        gpu_name = gpu_name
-                            .replace("Corporation ", "")
-                            .replace("Integrated Graphics Controller", "Graphics")
-                            .trim()
-                            .to_string();
-                        
-                        // Skip NVIDIA duplicates
-                        let normalized = gpu_name.to_lowercase();
-                        let is_nvidia_duplicate = gpus.iter().any(|g| {
-                            let g_lower = g.to_lowercase();
-                            g_lower.contains("nvidia")
-                                && normalized.contains("nvidia")
-                                && (g_lower.contains(&normalized.replace("nvidia ", ""))
-                                    || normalized.contains(&g_lower.replace("nvidia ", "")))
-                        });
-                        
-                        if !is_nvidia_duplicate && seen_names.insert(normalized) {
-                            gpus.push(gpu_name);
-                        }
+    if let Ok(o) = Command::new("lspci").output() {
+        if let Ok(s) = String::from_utf8(o.stdout) {
+            for l in s.lines() {
+                if l.contains("VGA") || l.contains("3D controller") {
+                    if let Some(name) = l.split(": ").nth(1) {
+                        let clean = name.split(" (rev").next().unwrap_or(name)
+                            .replace("Corporation ", "").trim().to_string();
+                        let key = clean.to_lowercase();
+                        let dup = seen.iter().any(|s: &String| 
+                            key.contains("nvidia") && s.contains("nvidia"));
+                        if !dup && seen.insert(key) { gpus.push(clean); }
                     }
                 }
             }
         }
     }
-    
-    if gpus.is_empty() {
-        gpus.push("No GPU detected".to_string());
-    }
-    
+    if gpus.is_empty() { gpus.push("No GPU detected".to_string()); }
     gpus
 }
 
-fn get_memory_swap() -> (String, String) {
-    let (mut mem_total, mut mem_available, mut swap_total, mut swap_free) =
-        (None, None, None, None);
-    
-    if let Ok(content) = fs::read_to_string("/proc/meminfo") {
-        for line in content.lines() {
-            if mem_total.is_none() && line.starts_with("MemTotal:") {
-                mem_total = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse::<u64>().ok());
-            } else if mem_available.is_none() && line.starts_with("MemAvailable:") {
-                mem_available = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse::<u64>().ok());
-            } else if swap_total.is_none() && line.starts_with("SwapTotal:") {
-                swap_total = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse::<u64>().ok());
-            } else if swap_free.is_none() && line.starts_with("SwapFree:") {
-                swap_free = line
-                    .split_whitespace()
-                    .nth(1)
-                    .and_then(|s| s.parse::<u64>().ok());
+fn get_memory_swap() -> (Option<(f64, f64)>, Option<(f64, f64)>) {
+    let (mut mt, mut ma, mut st, mut sf) = (None, None, None, None);
+    if let Ok(c) = fs::read_to_string("/proc/meminfo") {
+        for l in c.lines() {
+            if mt.is_none() && l.starts_with("MemTotal:") {
+                mt = l.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok());
+            } else if ma.is_none() && l.starts_with("MemAvailable:") {
+                ma = l.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok());
+            } else if st.is_none() && l.starts_with("SwapTotal:") {
+                st = l.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok());
+            } else if sf.is_none() && l.starts_with("SwapFree:") {
+                sf = l.split_whitespace().nth(1).and_then(|s| s.parse::<u64>().ok());
             }
-            
-            if mem_total.is_some()
-                && mem_available.is_some()
-                && swap_total.is_some()
-                && swap_free.is_some()
-            {
-                break;
-            }
+            if mt.is_some() && ma.is_some() && st.is_some() && sf.is_some() { break; }
         }
     }
-    
-    let memory = if let (Some(total), Some(available)) = (mem_total, mem_available) {
-        let used = total - available;
-        format!(
-            "{:.1} GiB / {:.1} GiB",
-            used as f64 / 1048576.0,
-            total as f64 / 1048576.0
-        )
-    } else {
-        "Unknown".to_string()
-    };
-    
-    let swap = if let (Some(total), Some(free)) = (swap_total, swap_free) {
-        if total > 0 {
-            let used = total - free;
-            format!(
-                "{:.1} GiB / {:.1} GiB",
-                used as f64 / 1048576.0,
-                total as f64 / 1048576.0
-            )
-        } else {
-            "0 B".to_string()
-        }
-    } else {
-        "0 B".to_string()
-    };
-    
-    (memory, swap)
+    let mem = if let (Some(t), Some(a)) = (mt, ma) {
+        Some(((t - a) as f64 / KB_TO_GIB, t as f64 / KB_TO_GIB))
+    } else { None };
+    let swap = if let (Some(t), Some(f)) = (st, sf) {
+        if t > 0 { Some(((t - f) as f64 / KB_TO_GIB, t as f64 / KB_TO_GIB)) }
+        else { None }
+    } else { None };
+    (mem, swap)
 }
 
-fn get_disk() -> String {
-    run_command("df -h /")
-        .ok()
-        .and_then(|output| {
-            output.lines().nth(1).map(|line| {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                if parts.len() >= 5 {
-                    format!("{} / {} ({})", parts[2], parts[1], parts[4])
-                } else {
-                    "Unknown".to_string()
-                }
-            })
-        })
-        .unwrap_or_else(|| "Unknown".to_string())
+fn get_disk() -> Option<(f64, f64)> {
+    run("df -BG /").and_then(|o| o.lines().nth(1).map(|l| {
+        let p: Vec<&str> = l.split_whitespace().collect();
+        if p.len() >= 4 {
+            let used = p[2].trim_end_matches('G').parse::<f64>().ok()?;
+            let total = p[1].trim_end_matches('G').parse::<f64>().ok()?;
+            Some((used, total))
+        } else { None }
+    }).flatten())
 }
 
-fn get_lsblk() -> Vec<String> {
-    run_command("lsblk -o NAME,SIZE,TYPE,MOUNTPOINT")
-        .ok()
-        .map(|output| output.lines().skip(1).map(String::from).collect())
-        .unwrap_or_default()
-}
-
-fn get_locale() -> String {
-    std::env::var("LANG")
-        .or_else(|_| std::env::var("LC_ALL"))
-        .unwrap_or_else(|_| "Unknown".to_string())
-}
-
-fn get_local_ip() -> String {
-    run_command("hostname -I")
-        .ok()
-        .and_then(|s| s.split_whitespace().next().map(String::from))
-        .unwrap_or_else(|| "Unknown".to_string())
-}
-
-fn get_public_ip() -> String {
-    run_command("curl -s ifconfig.me").unwrap_or_else(|_| "Unknown".to_string())
-}
-
-fn get_battery() -> String {
-    fs::read_dir("/sys/class/power_supply")
-        .ok()
-        .and_then(|entries| {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if let Some(name) = path.file_name() {
-                    if name.to_string_lossy().starts_with("BAT") {
-                        let capacity = fs::read_to_string(path.join("capacity"))
-                            .ok()?
-                            .trim()
-                            .to_string();
-                        let status = fs::read_to_string(path.join("status"))
-                            .ok()?
-                            .trim()
-                            .to_string();
-                        return Some(format!("{}% ({})", capacity, status));
-                    }
+fn get_battery() -> Option<(u8, String)> {
+    fs::read_dir("/sys/class/power_supply").ok().and_then(|entries| {
+        for e in entries.flatten() {
+            let p = e.path();
+            if let Some(n) = p.file_name() {
+                if n.to_string_lossy().starts_with("BAT") {
+                    let cap = fs::read_to_string(p.join("capacity")).ok()?
+                        .trim().parse::<u8>().ok()?;
+                    let stat = fs::read_to_string(p.join("status")).ok()?
+                        .trim().to_string();
+                    return Some((cap, stat));
                 }
             }
-            None
-        })
-        .unwrap_or_else(|| "Unknown".to_string())
+        }
+        None
+    })
 }
 
 fn get_logo(os: &str) -> Vec<String> {
-    let os_lower = os.to_lowercase();
-    
-    let lines = if os_lower.contains("arch") || os_lower.contains("cachy") {
-        vec![
-            "      /\\      ",
-            "     /  \\     ",
-            "    /\\   \\    ",
-            "   /  \\   \\   ",
-            "  /    \\   \\  ",
-            " /______\\___\\ ",
-        ]
-    } else if os_lower.contains("ubuntu") {
-        vec![
-            "         _     ",
-            "     ---(_)    ",
-            " _/  ---  \\    ",
-            "(_) |   |      ",
-            "  \\  --- _/    ",
-            "     ---(_)    ",
-        ]
-    } else if os_lower.contains("debian") {
-        vec![
-            "  _____  ",
-            " /  __ \\ ",
-            "|  /    |",
-            "|  \\___- ",
-            " -_      ",
-            "   --_   ",
-        ]
-    } else if os_lower.contains("fedora") {
-        vec![
-            "      _____    ",
-            "     /   __)\\  ",
-            "     |  /  \\ \\ ",
-            "  ___|  |__/ / ",
-            " / (_    _)_/  ",
-            "/ /  |  |      ",
-        ]
+    let ol = os.to_lowercase();
+    let lines = if ol.contains("arch") || ol.contains("cachy") {
+        vec!["      /\\      ", "     /  \\     ", "    /\\   \\    ", "   /  \\   \\   ", 
+             "  /    \\   \\  ", " /______\\___\\ "]
+    } else if ol.contains("ubuntu") {
+        vec!["         _     ", "     ---(_)    ", " _/  ---  \\    ", "(_) |   |      ", 
+             "  \\  --- _/    ", "     ---(_)    "]
+    } else if ol.contains("debian") {
+        vec!["  _____  ", " /  __ \\ ", "|  /    |", "|  \\___- ", " -_      ", "   --_   "]
+    } else if ol.contains("fedora") {
+        vec!["      _____    ", "     /   __)\\  ", "     |  /  \\ \\ ", "  ___|  |__/ / ", 
+             " / (_    _)_/  ", "/ /  |  |      "]
     } else {
-        vec![
-            "   ______   ",
-            "  /      \\  ",
-            " |  ◉  ◉  | ",
-            " |    >   | ",
-            " |  \\___/ | ",
-            "  \\______/  ",
-        ]
+        vec!["   ______   ", "  /      \\  ", " |  ◉  ◉  | ", " |    >   | ", " |  \\___/ | ", "  \\______/  "]
     };
-    
     lines.into_iter().map(String::from).collect()
-}
-
-fn run_command(cmd: &str) -> Result<String, ()> {
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
-    if parts.is_empty() {
-        return Err(());
-    }
-    
-    Command::new(parts[0])
-        .args(&parts[1..])
-        .output()
-        .ok()
-        .and_then(|output| {
-            if output.status.success() {
-                String::from_utf8(output.stdout)
-                    .ok()
-                    .map(|s| s.trim().to_string())
-            } else {
-                None
-            }
-        })
-        .ok_or(())
-}
-
-fn get_cached(cache: &Arc<Mutex<Cache>>, key: &str, f: fn() -> String) -> String {
-    let mut cache_guard = cache.lock().unwrap();
-    
-    if let Some(value) = cache_guard.get(key) {
-        return value;
-    }
-    
-    let value = f();
-    cache_guard.set(key, value.clone());
-    value
-}
-
-fn get_cached_vec(cache: &Arc<Mutex<Cache>>, key: &str, f: fn() -> Vec<String>) -> Vec<String> {
-    let mut cache_guard = cache.lock().unwrap();
-    
-    if let Some(value) = cache_guard.get(key) {
-        return value.split("||").map(String::from).collect();
-    }
-    
-    let value = f();
-    cache_guard.set(key, value.join("||"));
-    value
-}
-
-fn get_cached_static(cache: &Cache, key: &str, f: fn() -> String) -> String {
-    if let Some(value) = cache.get(key) {
-        return value;
-    }
-    f()
-}
-
-fn get_cached_vec_static(cache: &Cache, key: &str, f: fn() -> Vec<String>) -> Vec<String> {
-    if let Some(value) = cache.get(key) {
-        return value.split("||").map(String::from).collect();
-    }
-    f()
 }
