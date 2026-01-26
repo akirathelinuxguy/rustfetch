@@ -17,6 +17,7 @@ const SHOW_PACKAGES: bool = true;
 const SHOW_SHELL: bool = true;
 const SHOW_DE: bool = true;
 const SHOW_WM: bool = true;
+const SHOW_INIT: bool = true;
 const SHOW_TERMINAL: bool = true;
 const SHOW_CPU: bool = true;
 const SHOW_CPU_TEMP: bool = true;
@@ -48,9 +49,9 @@ struct Info {
     user: Option<String>, hostname: Option<String>, os: Option<String>,
     kernel: Option<String>, uptime: Option<String>, boot_time: Option<String>,
     packages: Option<String>, shell: Option<String>, de: Option<String>, 
-    wm: Option<String>, terminal: Option<String>, cpu: Option<String>,
-    cpu_temp: Option<String>, gpu: Option<Vec<String>>, gpu_temp: Option<String>,
-    memory: Option<(f64, f64)>, swap: Option<(f64, f64)>,
+    wm: Option<String>, init: Option<String>, terminal: Option<String>, 
+    cpu: Option<String>, cpu_temp: Option<String>, gpu: Option<Vec<String>>, 
+    gpu_temp: Option<String>, memory: Option<(f64, f64)>, swap: Option<(f64, f64)>,
     disks_detailed: Option<Vec<(String, f64, f64, f64, String)>>,
     partitions: Option<Vec<(String, String, f64, f64)>>,
     network: Option<String>, display: Option<String>,
@@ -95,7 +96,7 @@ fn progressive_display(cache: Arc<Mutex<Cache>>, info: Arc<Mutex<Info>>, logo: A
     let display_thread = thread::spawn(move || {
         let mut last_lines = 0;
         loop {
-            thread::sleep(Duration::from_millis(8));
+            thread::sleep(Duration::from_millis(5));
             if let (Ok(i), Ok(l)) = (info_c.lock(), logo_c.lock()) {
                 if last_lines > 0 { print!("\x1b[{}A\x1b[J", last_lines); }
                 last_lines = display_info(&i, &l);
@@ -168,6 +169,7 @@ fn gather_system_info(info: &mut Info, cache: &Cache) {
             .unwrap_or_else(|_| "Unknown".to_string()));
     }
     if SHOW_WM { info.wm = Some(cache_or(&cache, "wm", get_wm)); }
+    if SHOW_INIT { info.init = Some(cache_or(&cache, "init", get_init)); }
     if SHOW_TERMINAL {
         info.terminal = Some(std::env::var("TERM_PROGRAM")
             .or_else(|_| std::env::var("TERMINAL"))
@@ -220,6 +222,7 @@ fn check_loaded(i: &Info) -> bool {
         && (!SHOW_SHELL || i.shell.is_some())
         && (!SHOW_DE || i.de.is_some())
         && (!SHOW_WM || i.wm.is_some())
+        && (!SHOW_INIT || i.init.is_some())
         && (!SHOW_TERMINAL || i.terminal.is_some())
         && (!SHOW_CPU || i.cpu.is_some())
         && (!SHOW_CPU_TEMP || i.cpu_temp.is_some())
@@ -282,6 +285,7 @@ fn display_info(info: &Info, logo: &[String]) -> usize {
     add(&mut lines, SHOW_SHELL, &info.shell, "Shell", C_CYAN);
     add_filt(&mut lines, SHOW_DE, &info.de, "DE", C_CYAN);
     add_filt(&mut lines, SHOW_WM, &info.wm, "WM", C_CYAN);
+    add_filt(&mut lines, SHOW_INIT, &info.init, "Init", C_CYAN);
     add_filt(&mut lines, SHOW_TERMINAL, &info.terminal, "Terminal", C_CYAN);
     add(&mut lines, SHOW_CPU, &info.cpu, "CPU", C_GREEN);
     add_filt(&mut lines, SHOW_CPU_TEMP, &info.cpu_temp, "CPU Temp", C_YELLOW);
@@ -445,10 +449,17 @@ fn get_boot_time() -> String {
 }
 
 fn get_packages() -> String {
-    let count = try_count("pacman", &["-Qq"])
+    // Fast path: read package count from cache files where possible
+    let count = 
+        // Pacman - read database directly
+        fs::read_dir("/var/lib/pacman/local").ok()
+            .map(|entries| entries.count().saturating_sub(1)) // -1 for ALPM_DB_VERSION
+        // dpkg - fast query
         .or_else(|| try_count("dpkg-query", &["-f", ".\n", "-W"]))
+        // rpm
         .or_else(|| try_count("rpm", &["-qa"]))
         .unwrap_or(0);
+    
     if count > 0 { count.to_string() } else { "Unknown".to_string() }
 }
 
@@ -470,6 +481,37 @@ fn get_wm() -> String {
             }
         }
     }
+    "Unknown".to_string()
+}
+
+fn get_init() -> String {
+    // Check if systemd (fastest check - most common)
+    if fs::metadata("/run/systemd/system").is_ok() {
+        return "systemd".to_string();
+    }
+    
+    // Read /proc/1/comm for init process name
+    if let Ok(init_name) = fs::read_to_string("/proc/1/comm") {
+        let init = init_name.trim();
+        return match init {
+            "systemd" => "systemd".to_string(),
+            "init" => {
+                // Check which init system
+                if fs::metadata("/run/openrc").is_ok() {
+                    "openrc".to_string()
+                } else if fs::metadata("/etc/runit").is_ok() {
+                    "runit".to_string()
+                } else {
+                    "sysvinit".to_string()
+                }
+            },
+            "runit" => "runit".to_string(),
+            "dinit" => "dinit".to_string(),
+            "s6-svscan" => "s6".to_string(),
+            _ => init.to_string(),
+        }
+    }
+    
     "Unknown".to_string()
 }
 
@@ -554,28 +596,45 @@ fn get_disks_detailed() -> Option<Vec<(String, f64, f64, f64, String)>> {
         let disk_type = fields[2];
         let is_rotational = fields[3] == "1";
         
-        // Skip if not a disk
         if disk_type != "disk" { continue; }
         
         let size_gib = size_bytes / BYTES_TO_GIB;
         
-        // Get used space for this disk by summing all partitions
-        let used_gib = if let Some(used_output) = run(&format!("lsblk -bno NAME,FSUSED /dev/{}", name)) {
-            used_output.lines()
-                .filter_map(|l| {
-                    let parts: Vec<&str> = l.split_whitespace().collect();
-                    if parts.len() >= 2 {
-                        parts[1].parse::<f64>().ok()
-                    } else {
-                        None
-                    }
-                })
-                .sum::<f64>() / BYTES_TO_GIB
+        // Get used space
+        let used_gib = if name.starts_with("zram") {
+            fs::read_to_string(format!("/sys/block/{}/mm_stat", name))
+                .ok()
+                .and_then(|s| s.split_whitespace().next()
+                    .and_then(|v| v.parse::<f64>().ok()))
+                .map(|bytes| bytes / BYTES_TO_GIB)
+                .unwrap_or(0.0)
         } else {
-            0.0
+            // Get used space by summing up mounted partitions only
+            if let Some(df_output) = run("df -B1 --output=source,used") {
+                let mut seen = HashSet::new();
+                let total: f64 = df_output.lines()
+                    .skip(1) // Skip header
+                    .filter_map(|l| {
+                        let parts: Vec<&str> = l.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            let source = parts[0];
+                            // Only count partitions of this disk
+                            if source.starts_with(&format!("/dev/{}", name)) && seen.insert(source.to_string()) {
+                                parts[1].parse::<f64>().ok()
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .sum();
+                total / BYTES_TO_GIB
+            } else {
+                0.0
+            }
         };
         
-        // Determine disk type label
         let type_label = if name.starts_with("nvme") {
             "disk [NVME]"
         } else if name.starts_with("sd") {
@@ -590,49 +649,27 @@ fn get_disks_detailed() -> Option<Vec<(String, f64, f64, f64, String)>> {
         
         disks.push((name.to_string(), size_gib, used_gib, size_gib, type_label.to_string()));
         
-        if disks.len() >= 4 { break; }
+        if disks.len() >= 3 { break; }
     }
     
     if disks.is_empty() { None } else { Some(disks) }
 }
 
 fn get_partitions() -> Option<Vec<(String, String, f64, f64)>> {
-    let output = run("findmnt -rno SOURCE,TARGET,SIZE,USED -t ext4,xfs,btrfs,f2fs,ntfs,exfat,vfat")?;
+    let output = run("findmnt -rno SOURCE,TARGET,SIZE,USED -t ext4,xfs,btrfs,f2fs -e /,/boot,/snap")?;
     let mut parts: Vec<(String, String, f64, f64)> = Vec::new();
-    let mut seen_devices = HashSet::new();
+    let mut seen = HashSet::new();
     
-    for line in output.lines() {
+    for line in output.lines().take(5) {
         let fields: Vec<&str> = line.split_whitespace().collect();
         if fields.len() < 4 { continue; }
         
         let device = fields[0];
         let mount = fields[1];
         
-        // Skip root and system mounts
-        if mount == "/" 
-            || mount.starts_with("/boot") 
-            || mount.starts_with("/snap") 
-            || mount.starts_with("/run") 
-            || mount.starts_with("/sys") 
-            || mount.starts_with("/proc") 
-            || mount.starts_with("/dev")
-            || mount.starts_with("/var/lib")
-            || mount.starts_with("/var/snap")
-            || mount.starts_with("/var/log")
-            || mount.starts_with("/var/tmp")
-            || mount.starts_with("/var/cache")
-            || mount.starts_with("/root")
-            || mount.starts_with("/srv")
-            || mount.starts_with("/tmp")
-            || mount.starts_with("/opt")
-            || device.contains("[") {  // Skip btrfs subvolumes
-            continue;
-        }
+        if seen.contains(device) { continue; }
+        seen.insert(device.to_string());
         
-        // Skip duplicate devices
-        if seen_devices.contains(device) { continue; }
-        
-        // Parse sizes (findmnt returns bytes by default)
         if let (Some(total_bytes), Some(used_bytes)) = (
             fields[2].parse::<f64>().ok(),
             fields[3].parse::<f64>().ok()
@@ -640,13 +677,9 @@ fn get_partitions() -> Option<Vec<(String, String, f64, f64)>> {
             let total = total_bytes / BYTES_TO_GIB;
             let used = used_bytes / BYTES_TO_GIB;
             
-            // Only show partitions > 5 GiB and actually separate from root
             if total > 5.0 {
                 let dev_name = device.rsplit('/').next().unwrap_or(device);
                 parts.push((dev_name.to_string(), mount.to_string(), used, total));
-                seen_devices.insert(device.to_string());
-                
-                if parts.len() >= 5 { break; }
             }
         }
     }
@@ -673,40 +706,23 @@ fn get_battery() -> Option<(u8, String)> {
 }
 
 fn get_cpu_temp() -> Option<String> {
-    // Try hwmon sensors first
-    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            
-            // Check if this is a CPU thermal sensor
-            if let Ok(name) = fs::read_to_string(path.join("name")) {
-                let name = name.trim().to_lowercase();
-                if name.contains("coretemp") || name.contains("k10temp") || name.contains("zenpower") {
-                    // Find temp1_input (package temperature)
-                    if let Ok(temp) = fs::read_to_string(path.join("temp1_input")) {
-                        if let Ok(millidegrees) = temp.trim().parse::<i32>() {
-                            let celsius = millidegrees / 1000;
-                            return Some(format!("{}°C", celsius));
-                        }
-                    }
-                }
+    // Try most common hwmon paths first
+    for path in &[
+        "/sys/class/hwmon/hwmon0/temp1_input",
+        "/sys/class/hwmon/hwmon1/temp1_input",
+        "/sys/class/hwmon/hwmon2/temp1_input",
+    ] {
+        if let Ok(temp) = fs::read_to_string(path) {
+            if let Ok(millidegrees) = temp.trim().parse::<i32>() {
+                return Some(format!("{}°C", millidegrees / 1000));
             }
         }
     }
     
-    // Fallback to thermal_zone
-    for i in 0..10 {
-        let zone_path = format!("/sys/class/thermal/thermal_zone{}", i);
-        if let Ok(zone_type) = fs::read_to_string(format!("{}/type", zone_path)) {
-            let zone_type = zone_type.trim().to_lowercase();
-            if zone_type.contains("cpu") || zone_type.contains("x86_pkg") || zone_type.contains("acpi") {
-                if let Ok(temp) = fs::read_to_string(format!("{}/temp", zone_path)) {
-                    if let Ok(millidegrees) = temp.trim().parse::<i32>() {
-                        let celsius = millidegrees / 1000;
-                        return Some(format!("{}°C", celsius));
-                    }
-                }
-            }
+    // Fallback: check thermal zones
+    if let Ok(temp) = fs::read_to_string("/sys/class/thermal/thermal_zone0/temp") {
+        if let Ok(millidegrees) = temp.trim().parse::<i32>() {
+            return Some(format!("{}°C", millidegrees / 1000));
         }
     }
     
@@ -714,32 +730,19 @@ fn get_cpu_temp() -> Option<String> {
 }
 
 fn get_gpu_temp() -> Option<String> {
-    // NVIDIA GPU temperature
-    if let Ok(output) = Command::new("nvidia-smi")
-        .args(&["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"])
-        .stderr(std::process::Stdio::null())
-        .output() {
-        if output.status.success() {
-            if let Ok(temp_str) = String::from_utf8(output.stdout) {
-                if let Ok(temp) = temp_str.trim().parse::<i32>() {
-                    return Some(format!("{}°C", temp));
-                }
-            }
-        }
-    }
-    
-    // AMD/Intel GPU via hwmon
-    if let Ok(entries) = fs::read_dir("/sys/class/hwmon") {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if let Ok(name) = fs::read_to_string(path.join("name")) {
-                let name = name.trim().to_lowercase();
-                if name.contains("amdgpu") || name.contains("radeon") || name.contains("i915") {
-                    if let Ok(temp) = fs::read_to_string(path.join("temp1_input")) {
-                        if let Ok(millidegrees) = temp.trim().parse::<i32>() {
-                            let celsius = millidegrees / 1000;
-                            return Some(format!("{}°C", celsius));
-                        }
+    // Try hwmon first (faster)
+    for path in &[
+        "/sys/class/hwmon/hwmon0/temp1_input",
+        "/sys/class/hwmon/hwmon1/temp1_input", 
+        "/sys/class/hwmon/hwmon2/temp1_input",
+        "/sys/class/hwmon/hwmon3/temp1_input",
+    ] {
+        if let Ok(name_path) = fs::read_to_string(path.replace("temp1_input", "name")) {
+            let name = name_path.trim().to_lowercase();
+            if name.contains("amdgpu") || name.contains("radeon") || name.contains("nvidia") {
+                if let Ok(temp) = fs::read_to_string(path) {
+                    if let Ok(millidegrees) = temp.trim().parse::<i32>() {
+                        return Some(format!("{}°C", millidegrees / 1000));
                     }
                 }
             }
@@ -750,64 +753,40 @@ fn get_gpu_temp() -> Option<String> {
 }
 
 fn get_network() -> Option<String> {
-    // Read default route to find active interface
-    let route_output = run("ip route show default")?;
-    let interface = route_output
-        .split_whitespace()
-        .skip_while(|&w| w != "dev")
-        .nth(1)?;
-    
-    // Get IP address for that interface
-    let ip_output = run(&format!("ip -4 addr show {}", interface))?;
-    let ip = ip_output
-        .lines()
-        .find(|l| l.trim().starts_with("inet "))?
-        .split_whitespace()
-        .nth(1)?
-        .split('/')
-        .next()?;
-    
-    Some(format!("{} ({})", ip, interface))
+    // Fast path: read from /proc/net/route
+    if let Ok(routes) = fs::read_to_string("/proc/net/route") {
+        for line in routes.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 2 && fields[1] == "00000000" {
+                let iface = fields[0];
+                // Get IP from ip command (fast)
+                if let Some(ip) = run(&format!("ip -4 -br addr show {}", iface)) {
+                    if let Some(ip_addr) = ip.split_whitespace().nth(2) {
+                        let clean_ip = ip_addr.split('/').next().unwrap_or(ip_addr);
+                        return Some(format!("{} ({})", clean_ip, iface));
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 fn get_display() -> Option<String> {
-    // Check display server
+    // Check display server via env (fastest)
     let session_type = std::env::var("XDG_SESSION_TYPE").ok()?;
     
-    // Get resolution
     if session_type == "wayland" {
-        // Try wlr-randr for wlroots compositors
-        if let Some(output) = run("wlr-randr") {
-            for line in output.lines() {
-                if line.contains("current") {
-                    if let Some(res) = line.split_whitespace()
-                        .find(|w| w.contains('x') && w.chars().next().unwrap().is_numeric()) {
-                        let res_clean = res.trim_end_matches(',');
-                        return Some(format!("{} @ Wayland", res_clean));
-                    }
-                }
-            }
-        }
-        // Fallback for Wayland
-        return Some("Wayland".to_string());
+        Some("Wayland".to_string())
     } else {
-        // X11 - use xrandr
-        if let Some(output) = run("xrandr") {
-            for line in output.lines() {
-                if line.contains('*') {
-                    if let Some(res) = line.split_whitespace()
-                        .find(|w| w.contains('x') && w.chars().next().unwrap().is_numeric()) {
-                        let rate = line.split_whitespace()
-                            .find(|w| w.contains('*'))
-                            .and_then(|r| r.trim_end_matches('*').parse::<f32>().ok())
-                            .map(|r| format!("{}Hz", r.round() as i32))
-                            .unwrap_or_default();
-                        return Some(format!("{} @ {} (X11)", res, rate));
-                    }
-                }
+        // X11 - try to get resolution quickly
+        if let Some(output) = run("xrandr --current 2>/dev/null | grep '*'") {
+            if let Some(res) = output.split_whitespace()
+                .find(|w| w.contains('x') && w.chars().next().unwrap().is_numeric()) {
+                return Some(format!("{} (X11)", res));
             }
         }
-        return Some("X11".to_string());
+        Some("X11".to_string())
     }
 }
 
