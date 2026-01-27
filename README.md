@@ -1,88 +1,119 @@
-
 # rustfetch
 
-A minimal yet highly customizable system information fetcher written in Rust. Supports Linux, BSD, and macOS, with GPU detection and OS-specific icons. No external dependencies, easy to extend and configure. WHICH USES RUST BTW
-
----
+A minimal system information fetcher written in Rust. Fast, dependency-free, and highly customizable.
 
 ## Features
 
-- Retrieves hostname, OS, CPU (model, cores, threads), memory, uptime.
-- Detects GPU (Linux/BSD/macOS).
-- Supports modern distros and custom OS logos.
-- Colorized output with toggle.
-- Simple configuration via constants.
-- No external libraries; fully self-contained.
+- **System Info**: Hostname, OS, kernel, CPU, memory, uptime, boot time
+- **GPU Detection**: Supports Linux, BSD, macOS
+- **Bootloader**: Detects Limine, GRUB, systemd-boot, and others
+- **Storage**: Disk usage and partitions with progress bars
+- **Network**: Current IP address and interface
+- **Battery**: Percentage and charging status
+- **Colors**: RGB color support with toggle
+- **Fast**: Caching and parallel processing
+- **No Dependencies**: Pure Rust, standard library only
 
----
-
-## Usage
-
-1. Download the source code:
+## Install
 
 ```bash
+# Download
 git clone https://github.com/akirathelinuxguy/rustfetch.git
 cd rustfetch
-```
 
-2. Build the project:
+# Build
+rustc -C opt-level=3 rustfetch.rs
 
-```bash
-rustc -C opt-level=3 -C target-cpu=native -C lto=fat rustfetch.rs
-```
-
-3. Run the binary:
-
-```bash
+# Run
 ./rustfetch
-```
+Or with Cargo:
 
----
+bash
+cargo build --release
+./target/release/rustfetch
+Configuration
+Edit the constants in rustfetch.rs:
 
-## Customization
+rust
+// Toggle features
+const USE_COLOR: bool = true;
+const SHOW_GPU: bool = true;
+const SHOW_BOOTLOADER: bool = true;
+const SHOW_BATTERY: bool = true;
+// ... more options at top of file
+ASCII Art
+Add your own logos:
 
-You can tweak the behavior and appearance by editing the constants at the top of `rustfetch.rs`:
+Create /usr/share/rustfetch/logos/your-os.ascii
 
-```rust
-// ==== CONFIGURATION ====
-// Toggle GPU detection
-const ENABLE_GPU_DETECTION: bool = true;
-// Toggle colored output
-const USE_COLOR_OUTPUT: bool = true;
-```
+Or edit the get_logo() function
 
-You can also add or modify OS logos in the `get_os_icon()` function for more personalized icons. because im to lazy to add every distro myself
+Built-in logos for:
 
----
+Arch Linux / CachyOS
 
-## Supported Platforms
+Ubuntu
 
-- Linux (including various distros) i personally use cachy os therefore it works on arch based
-- FreeBSD, OpenBSD, NetBSD
-- macOS
+Debian
 
-*Note:* Uptime and GPU detection may be limited or unavailable on some platforms. ( mac os )
+Fedora
 
----
+Windows
 
-## License
+macOS
 
-This project is licensed under the MIT License idk why it just seems better. See `LICENSE` for details.
+Linux (generic)
 
----
+And more
 
-## Acknowledgements
+Supported Systems
+Linux: Arch, Ubuntu, Debian, Fedora, etc. (I use CachyOS)
 
-- Inspired by `neofetch` and `fastfetch` and rusthead propaganda
-- Uses native system commands and files for maximum compatibility without dependencies.
+BSD: FreeBSD, OpenBSD, NetBSD
 
----
+macOS: Limited GPU support
 
-## Contributing
+Package Managers
+pacman (Arch)
 
-Contributions are welcome! Feel free to fork and extend the project. Keep it sub 2000 lines and make it stay how it is with depencies i hate them with a passion. 
+dpkg (Debian/Ubuntu)
 
----
+rpm (Fedora/RHEL)
 
-## Contact Me 
-Do it via issues like a normal person Or email me via reubenpercival14@gmail.com
+xbps (Void)
+
+And others
+
+Example
+text
+      /\        user@host
+     /  \       ─────────
+    /\   \      OS: CachyOS
+   /  \   \     Kernel: 6.18.7
+  /    \   \    Uptime: 1h 30m
+ /______\___\   Bootloader: Limine
+                CPU: Intel Core i7 (8 cores)
+                GPU: NVIDIA RTX 3060
+                Memory: 4.2/15.6 GiB [████░░░░░░░░░░░░░░] 27%
+No Dependencies
+This tool uses only Rust's standard library. No external crates.
+
+Building for Speed
+bash
+rustc -C opt-level=3 -C target-cpu=native rustfetch.rs
+Contributing
+Keep it:
+
+Dependency-free
+
+Under 2000 lines
+
+Fast and simple
+
+License
+MIT License
+
+Contact
+GitHub Issues
+
+Email: reubenpercival14@gmail.com
