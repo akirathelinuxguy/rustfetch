@@ -1,119 +1,103 @@
 # rustfetch
 
-A minimal system information fetcher written in Rust. Fast, dependency-free, and highly customizable.
+A minimal yet highly customizable system information fetcher written in Rust. Supports Linux, BSD, and macOS, with GPU detection and OS-specific icons. No external dependencies, easy to extend and configure. WHICH USES RUST BTW
+
+---
+
 
 ## Features
-
 - **System Info**: Hostname, OS, kernel, CPU, memory, uptime, boot time
-- **GPU Detection**: Supports Linux, BSD, macOS
-- **Bootloader**: Detects Limine, GRUB, systemd-boot, and others
+- **GPU Detection**: Supports Linux/BSD/macOS with temperature monitoring
+- **Bootloader Detection**: Limine, GRUB, systemd-boot, Windows Boot Manager, rEFInd, etc.
 - **Storage**: Disk usage and partitions with progress bars
-- **Network**: Current IP address and interface
+- **Network**: IP address and interface
 - **Battery**: Percentage and charging status
-- **Colors**: RGB color support with toggle
+- **DE/WM**: Desktop environment and window manager
+- **Packages**: Count for various package managers
+- **RGB Colors**: Colorized output with toggle
+- **ASCII Art**: OS-specific logos with external file support
 - **Fast**: Caching and parallel processing
-- **No Dependencies**: Pure Rust, standard library only
+- **No Dependencies**: Pure Rust standard library only
 
-## Install
+---
+
+## Usage
+
+1. Download the source code:
 
 ```bash
-# Download
-git clone https://github.com/akirathelinuxguy/rustfetch.git
+git clone https://codeberg.org/akirathelinuxguy/rustfetch.git
 cd rustfetch
+```
 
-# Build
-rustc -C opt-level=3 rustfetch.rs
+2. Build the project: with this exact prompts for its optmisations
 
-# Run
+```bash
+rustc -C opt-level=3 -C target-cpu=native -C lto=fat rustfetch.rs
+```
+
+3. Run the binary:
+
+```bash
 ./rustfetch
-Or with Cargo:
+```
 
-bash
-cargo build --release
-./target/release/rustfetch
-Configuration
-Edit the constants in rustfetch.rs:
+---
 
-rust
-// Toggle features
+## Customization
+
+
+## Configuration
+Edit constants in rustfetch.rs top of file
+
+// Display
 const USE_COLOR: bool = true;
+const PROGRESSIVE_DISPLAY: bool = false;
+const CACHE_ENABLED: bool = true;
+
+// Information toggles
 const SHOW_GPU: bool = true;
 const SHOW_BOOTLOADER: bool = true;
 const SHOW_BATTERY: bool = true;
+const SHOW_CPU_TEMP: bool = true;
+const SHOW_GPU_TEMP: bool = true;
+const SHOW_DISKS_DETAILED: bool = true;
 // ... more options at top of file
-ASCII Art
-Add your own logos:
 
-Create /usr/share/rustfetch/logos/your-os.ascii
+You can also add or modify OS logos in the `get_os_icon()` function for more personalized icons. because im to lazy to add every distro myself
 
-Or edit the get_logo() function
+---
 
-Built-in logos for:
+## Supported Platforms
 
-Arch Linux / CachyOS
+- Linux (including various distros) i personally use cachy os therefore it works on arch based
+- FreeBSD, OpenBSD, NetBSD
+- macOS
 
-Ubuntu
+*Note:* Uptime and GPU detection may be limited or unavailable on some platforms. ( mac os )
 
-Debian
+---
 
-Fedora
+## License
 
-Windows
+This project is licensed under the MIT License idk why it just seems better. See `LICENSE` for details.
 
-macOS
+---
 
-Linux (generic)
+## Acknowledgements
 
-And more
+- Inspired by `neofetch` and `fastfetch` and rusthead propaganda
+- Uses native system commands and files for maximum compatibility without dependencies.
 
-Supported Systems
-Linux: Arch, Ubuntu, Debian, Fedora, etc. (I use CachyOS)
+---
 
-BSD: FreeBSD, OpenBSD, NetBSD
+## Contributing
 
-macOS: Limited GPU support
+Contributions are welcome! Feel free to fork and extend the project.
 
-Package Managers
-pacman (Arch)
+---
 
-dpkg (Debian/Ubuntu)
+## Contact Me 
+Do it via issues like a normal person or email me at reubenpercival14@gmail.com
 
-rpm (Fedora/RHEL)
 
-xbps (Void)
-
-And others
-
-Example
-text
-      /\        user@host
-     /  \       ─────────
-    /\   \      OS: CachyOS
-   /  \   \     Kernel: 6.18.7
-  /    \   \    Uptime: 1h 30m
- /______\___\   Bootloader: Limine
-                CPU: Intel Core i7 (8 cores)
-                GPU: NVIDIA RTX 3060
-                Memory: 4.2/15.6 GiB [████░░░░░░░░░░░░░░] 27%
-No Dependencies
-This tool uses only Rust's standard library. No external crates.
-
-Building for Speed
-bash
-rustc -C opt-level=3 -C target-cpu=native rustfetch.rs
-Contributing
-Keep it:
-
-Dependency-free
-
-Under 2000 lines
-
-Fast and simple
-
-License
-MIT License
-
-Contact
-GitHub Issues
-
-Email: reubenpercival14@gmail.com
