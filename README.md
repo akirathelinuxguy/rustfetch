@@ -26,7 +26,7 @@ A minimal yet highly customizable system information fetcher written in Rust. Su
 1. Download the source code:
 
 ```bash
-git clone https://codeberg.org/akirathelinuxguy/rustfetch.git
+git clone https://github.com/akirathelinuxguy/rustfetch.git
 cd rustfetch
 ```
 
