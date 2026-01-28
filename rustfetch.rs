@@ -1,45 +1,233 @@
 use std::{
-    fs, process::Command, thread, sync::{Arc, Mutex}, 
+    env,
+    fs,
     path::Path,
+    process::Command,
+    thread,
 };
 
 // ============================================================================
-// CONFIGURATION CONSTANTS
+// VERSION INFO
 // ============================================================================
 
-const PROGRESSIVE_DISPLAY: bool = false;
-const USE_COLOR: bool = true;
-const CACHE_ENABLED: bool = true;
+const VERSION: &str = "1.0.0";
+const PROGRAM_NAME: &str = "rustfetch";
+
+// ============================================================================
+// CLI ARGUMENT PARSING
+// ============================================================================
+
+#[derive(Clone)]
+struct Config {
+    use_color: bool,
+    color_scheme: String,
+    json_output: bool,
+    cache_enabled: bool,
+    show_os: bool,
+    show_kernel: bool,
+    show_uptime: bool,
+    show_boot_time: bool,
+    show_bootloader: bool,
+    show_packages: bool,
+    show_shell: bool,
+    show_de: bool,
+    show_wm: bool,
+    show_init: bool,
+    show_terminal: bool,
+    show_cpu: bool,
+    show_cpu_temp: bool,
+    show_gpu: bool,
+    show_memory: bool,
+    show_swap: bool,
+    show_partitions: bool,
+    show_network: bool,
+    show_display: bool,
+    show_battery: bool,
+    show_colors: bool,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            use_color: true,
+            color_scheme: "classic".to_string(),
+            json_output: false,
+            cache_enabled: true,
+            show_os: true,
+            show_kernel: true,
+            show_uptime: true,
+            show_boot_time: true,
+            show_bootloader: true,
+            show_packages: true,
+            show_shell: true,
+            show_de: true,
+            show_wm: true,
+            show_init: true,
+            show_terminal: true,
+            show_cpu: true,
+            show_cpu_temp: true,
+            show_gpu: true,
+            show_memory: true,
+            show_swap: true,
+            show_partitions: true,
+            show_network: true,
+            show_display: true,
+            show_battery: true,
+            show_colors: true,
+        }
+    }
+}
+
+fn print_help() {
+    println!(
+        r#"{} {} - A fast system information tool
+
+USAGE:
+    {} [OPTIONS]
+
+OPTIONS:
+    -h, --help          Show this help message
+    -h, --help          Show this help message
+    -j, --json          Output system info as JSON
+    -n, --no-color      Disable colored output
+    -t, --theme <NAME>  Set color theme (classic, pastel, gruvbox, nord, dracula)
+    --no-cache          Disable caching
+
+MODULES:
+    --os / --no-os
+    --kernel / --no-kernel
+    --uptime / --no-uptime
+    --cpu / --no-cpu
+    --memory / --no-memory
+    --gpu / --no-gpu
+    --shell / --no-shell
+    --terminal / --no-terminal
+    --packages / --no-packages
+    --disk / --no-disk
+    --network / --no-network
+    --battery / --no-battery
+    (All modules enabled by default)
+
+EXAMPLES:
+    {}              Show system info with default settings
+    {} --no-gpu     Show info without GPU
+    {} -t gruvbox   Use gruvbox color theme"#,
+        PROGRAM_NAME, VERSION, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME
+    );
+}
+
+
+
+fn parse_args() -> Option<Config> {
+    let args: Vec<String> = env::args().collect();
+    let mut config = Config::default();
+    
+    // Respect NO_COLOR environment variable (standard)
+    if env::var("NO_COLOR").is_ok() {
+        config.use_color = false;
+    }
+    
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_help();
+                return None;
+            }
+
+            "-j" | "--json" => {
+                config.json_output = true;
+                config.use_color = false;
+            }
+            "-n" | "--no-color" => {
+                config.use_color = false;
+            }
+            "--no-cache" => {
+                config.cache_enabled = false;
+            }
+            "-t" | "--theme" => {
+                i += 1;
+                if i < args.len() {
+                    let theme = args[i].to_lowercase();
+                    match theme.as_str() {
+                        "classic" | "pastel" | "gruvbox" | "nord" | "dracula" => {
+                            config.color_scheme = theme;
+                        }
+                        _ => {
+                            eprintln!("Unknown theme '{}'. Available: classic, pastel, gruvbox, nord, dracula", args[i]);
+                            return None;
+                        }
+                    }
+                } else {
+                    eprintln!("Error: --theme requires a theme name");
+                    return None;
+                }
+            }
+            // Module toggles
+            "--os" => config.show_os = true,
+            "--no-os" => config.show_os = false,
+            "--kernel" => config.show_kernel = true,
+            "--no-kernel" => config.show_kernel = false,
+            "--uptime" => config.show_uptime = true,
+            "--no-uptime" => config.show_uptime = false,
+            "--boot-time" => config.show_boot_time = true,
+            "--no-boot-time" => config.show_boot_time = false,
+            "--bootloader" => config.show_bootloader = true,
+            "--no-bootloader" => config.show_bootloader = false,
+            "--packages" => config.show_packages = true,
+            "--no-packages" => config.show_packages = false,
+            "--shell" => config.show_shell = true,
+            "--no-shell" => config.show_shell = false,
+            "--de" => config.show_de = true,
+            "--no-de" => config.show_de = false,
+            "--wm" => config.show_wm = true,
+            "--no-wm" => config.show_wm = false,
+            "--init" => config.show_init = true,
+            "--no-init" => config.show_init = false,
+            "--terminal" => config.show_terminal = true,
+            "--no-terminal" => config.show_terminal = false,
+            "--cpu" => config.show_cpu = true,
+            "--no-cpu" => config.show_cpu = false,
+            "--cpu-temp" => config.show_cpu_temp = true,
+            "--no-cpu-temp" => config.show_cpu_temp = false,
+            "--gpu" => config.show_gpu = true,
+            "--no-gpu" => config.show_gpu = false,
+            "--memory" => config.show_memory = true,
+            "--no-memory" => config.show_memory = false,
+            "--swap" => config.show_swap = true,
+            "--no-swap" => config.show_swap = false,
+            "--disk" | "--partitions" => config.show_partitions = true,
+            "--no-disk" | "--no-partitions" => config.show_partitions = false,
+            "--network" => config.show_network = true,
+            "--no-network" => config.show_network = false,
+            "--display" => config.show_display = true,
+            "--no-display" => config.show_display = false,
+            "--battery" => config.show_battery = true,
+            "--no-battery" => config.show_battery = false,
+            "--colors" => config.show_colors = true,
+            "--no-colors" => config.show_colors = false,
+            
+            arg if arg.starts_with('-') => {
+                eprintln!("Unknown option: {}", arg);
+                eprintln!("Try '{} --help' for more information.", PROGRAM_NAME);
+                return None;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    
+    Some(config)
+}
+
+// ============================================================================
+// CONSTANTS
+// ============================================================================
+
 const CACHE_FILE: &str = "/tmp/rustfetch_cache";
 const PROGRESS_BAR_WIDTH: usize = 20;
 
-// Color scheme selection - now defaults to "classic" for universal appeal
-const COLOR_SCHEME: &str = "classic";
 
-// Toggle display of each section
-const SHOW_OS: bool = true;
-const SHOW_KERNEL: bool = true;
-const SHOW_UPTIME: bool = true;
-const SHOW_BOOT_TIME: bool = true;
-const SHOW_BOOTLOADER: bool = true;
-const SHOW_PACKAGES: bool = true;
-const SHOW_SHELL: bool = true;
-const SHOW_DE: bool = true;
-const SHOW_WM: bool = true;
-const SHOW_INIT: bool = true;
-const SHOW_TERMINAL: bool = true;
-const SHOW_CPU: bool = true;
-const SHOW_CPU_TEMP: bool = true;
-const SHOW_GPU: bool = true;
-const SHOW_GPU_TEMP: bool = true;
-const SHOW_MEMORY: bool = true;
-const SHOW_SWAP: bool = true;
-const SHOW_DISKS_DETAILED: bool = false; // Disabled - partition info is more useful
-const SHOW_PARTITIONS: bool = true;
-const SHOW_NETWORK: bool = true;
-const SHOW_DISPLAY: bool = true;
-const SHOW_BATTERY: bool = true;
-const SHOW_COLORS: bool = true;
 
 // ============================================================================
 // RGB COLOR SCHEMES
@@ -62,8 +250,27 @@ struct ColorScheme {
 }
 
 impl ColorScheme {
-    fn get() -> Self {
-        match COLOR_SCHEME {
+    fn new(config: &Config) -> Self {
+        // Return empty strings for all colors if color is disabled
+        if !config.use_color {
+            return ColorScheme {
+                reset: "",
+                bold: "",
+                primary: String::new(),
+                secondary: String::new(),
+                warning: String::new(),
+                error: String::new(),
+                muted: String::new(),
+                color1: String::new(),
+                color2: String::new(),
+                color3: String::new(),
+                color4: String::new(),
+                color5: String::new(),
+                color6: String::new(),
+            };
+        }
+
+        match config.color_scheme.as_str() {
             "classic" => ColorScheme {
                 reset: "\x1b[0m",
                 bold: "\x1b[1m",
@@ -163,7 +370,8 @@ fn format_rgb(r: u8, g: u8, b: u8) -> String {
 }
 
 const KB_TO_GIB: f64 = 1024.0 * 1024.0;
-const BYTES_TO_GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+// BYTES_TO_GIB removed
+
 const MIN_TEMP_MILLIDEGREES: i32 = 1000;
 const MAX_TEMP_MILLIDEGREES: i32 = 150_000;
 const FILLED_CHAR: char = '█';
@@ -268,10 +476,9 @@ struct Info {
     cpu: Option<String>,
     cpu_temp: Option<String>,
     gpu: Option<Vec<String>>,
-    gpu_temps: Option<Vec<Option<String>>>, // Changed to Vec to support multiple GPUs
+    gpu_temps: Option<Vec<Option<String>>>,
     memory: Option<(f64, f64)>,
     swap: Option<(f64, f64)>,
-    disks: Option<Vec<(String, f64, f64, f64, String)>>,
     partitions: Option<Vec<(String, String, f64, f64)>>,
     network: Option<Vec<NetworkInfo>>,
     display: Option<String>,
@@ -358,11 +565,7 @@ impl ToJson for Info {
 // CACHE SYSTEM (SIMPLE KEY-VALUE)
 // ============================================================================
 
-fn save_cache(info: &Info) {
-    if !CACHE_ENABLED {
-        return;
-    }
-    
+fn save_cache(info: &Info, _config: &Config) {
     let json = info.to_json();
     let _ = fs::write(CACHE_FILE, json);
 }
@@ -375,91 +578,100 @@ fn save_cache(info: &Info) {
 // ============================================================================
 
 fn main() {
-    let info = Arc::new(Mutex::new(Info::default()));
-    let mut threads = vec![];
+    // Parse command line arguments
+    let config = match parse_args() {
+        Some(cfg) => cfg,
+        None => return,
+    };
     
-    let tasks: Vec<(&str, Box<dyn Fn() -> Box<dyn std::any::Any + Send> + Send>)> = vec![
-        ("user_hostname", Box::new(|| Box::new((get_user(), get_hostname())))),
-        ("os", Box::new(|| Box::new(get_os()))),
-        ("kernel", Box::new(|| Box::new(get_kernel()))),
-        ("uptime", Box::new(|| Box::new(get_uptime()))),
-        ("boot_time", Box::new(|| Box::new(get_boot_time()))),
-        ("bootloader", Box::new(|| Box::new(get_bootloader()))),
-        ("packages", Box::new(|| Box::new(get_packages()))),
-        ("shell", Box::new(|| Box::new(get_shell()))),
-        ("de", Box::new(|| Box::new(get_de()))),
-        ("wm", Box::new(|| Box::new(get_wm()))),
-        ("init", Box::new(|| Box::new(get_init()))),
-        ("terminal", Box::new(|| Box::new(get_terminal()))),
-        ("cpu", Box::new(|| Box::new(get_cpu()))),
-        ("cpu_temp", Box::new(|| Box::new(get_cpu_temp()))),
-        ("gpu", Box::new(|| Box::new(get_gpu()))),
-        ("gpu_temps", Box::new(|| Box::new(get_gpu_temp()))),
-        ("memory", Box::new(|| Box::new(get_memory()))),
-        ("swap", Box::new(|| Box::new(get_swap()))),
-        ("disks", Box::new(|| Box::new(get_disks()))),
-        ("partitions", Box::new(|| Box::new(get_partitions()))),
-        ("network", Box::new(|| Box::new(get_network()))),
-        ("display", Box::new(|| Box::new(get_display()))),
-        ("battery", Box::new(|| Box::new(get_battery()))),
-    ];
-    
-    for (name, task) in tasks {
-        let info_clone = Arc::clone(&info);
-        let t = thread::spawn(move || {
-            let result = task();
-            let mut data = info_clone.lock().unwrap();
-            match name {
-                "user_hostname" => {
-                    if let Some((user, host)) = result.downcast_ref::<(Option<String>, Option<String>)>() {
-                        data.user = user.clone();
-                        data.hostname = host.clone();
-                    }
-                }
-                "os" => data.os = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "kernel" => data.kernel = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "uptime" => data.uptime = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "boot_time" => data.boot_time = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "bootloader" => data.bootloader = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "packages" => data.packages = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "shell" => data.shell = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "de" => data.de = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "wm" => data.wm = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "init" => data.init = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "terminal" => data.terminal = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "cpu" => data.cpu = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "cpu_temp" => data.cpu_temp = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "gpu" => data.gpu = result.downcast_ref::<Option<Vec<String>>>().cloned().flatten(),
-                "gpu_temps" => data.gpu_temps = result.downcast_ref::<Option<Vec<Option<String>>>>().cloned().flatten(),
-                "memory" => data.memory = result.downcast_ref::<Option<(f64, f64)>>().cloned().flatten(),
-                "swap" => data.swap = result.downcast_ref::<Option<(f64, f64)>>().cloned().flatten(),
-                "disks" => data.disks = result.downcast_ref::<Option<Vec<(String, f64, f64, f64, String)>>>().cloned().flatten(),
-                "partitions" => data.partitions = result.downcast_ref::<Option<Vec<(String, String, f64, f64)>>>().cloned().flatten(),
-                "network" => data.network = result.downcast_ref::<Option<Vec<NetworkInfo>>>().cloned().flatten(),
-                "display" => data.display = result.downcast_ref::<Option<String>>().cloned().flatten(),
-                "battery" => data.battery = result.downcast_ref::<Option<(u8, String)>>().cloned().flatten(),
-                _ => {}
-            }
-            
-            if PROGRESSIVE_DISPLAY {
-                render_output(&*data);
-            }
+    // Use thread::scope for automatic join and no Arc overhead
+    let info = thread::scope(|s| {
+        // Thread 1: Fast file reads (no external commands)
+        let t1 = s.spawn(|| {
+            let user = get_user();
+            let hostname = get_hostname();
+            let os = get_os();
+            let kernel = get_kernel();
+            let uptime = get_uptime();
+            let shell = get_shell();
+            let de = get_de();
+            let init = get_init();
+            let terminal = get_terminal();
+            let display = get_display();
+            (user, hostname, os, kernel, uptime, shell, de, init, terminal, display)
         });
-        threads.push(t);
+        
+        // Thread 2: Hardware info (CPU, memory, temps - all from /proc and /sys)
+        let t2 = s.spawn(|| {
+            let cpu = get_cpu();
+            let cpu_temp = get_cpu_temp();
+            let memory = get_memory();
+            let swap = get_swap();
+            let battery = get_battery();
+            (cpu, cpu_temp, memory, swap, battery)
+        });
+        
+        // Thread 3: GPU info (requires lspci - expensive, do once)
+        let t3 = s.spawn(|| {
+            let gpus = get_gpu();
+            let gpu_temps = get_gpu_temp_with_gpus(gpus.as_ref());
+            (gpus, gpu_temps)
+        });
+        
+        // Thread 4: External commands (slowest - packages, network, disk, boot info)
+        let t4 = s.spawn(|| {
+            let packages = get_packages();
+            let partitions = get_partitions();
+            let network = get_network();
+            let boot_time = get_boot_time();
+            let bootloader = get_bootloader();
+            let wm = get_wm();
+            (packages, partitions, network, boot_time, bootloader, wm)
+        });
+        
+        // Collect results (no mutex needed with scope)
+        let (user, hostname, os, kernel, uptime, shell, de, init, terminal, display) = t1.join().unwrap();
+        let (cpu, cpu_temp, memory, swap, battery) = t2.join().unwrap();
+        let (gpu, gpu_temps) = t3.join().unwrap();
+        let (packages, partitions, network, boot_time, bootloader, wm) = t4.join().unwrap();
+        
+        Info {
+            user,
+            hostname,
+            os,
+            kernel,
+            uptime,
+            boot_time,
+            bootloader,
+            packages,
+            shell,
+            de,
+            wm,
+            init,
+            terminal,
+            cpu,
+            cpu_temp,
+            gpu,
+            gpu_temps,
+            memory,
+            swap,
+            partitions,
+            network,
+            display,
+            battery,
+        }
+    });
+    
+    // Output based on mode
+    if config.json_output {
+        println!("{}", info.to_json());
+    } else {
+        render_output(&info, &config);
     }
     
-    for t in threads {
-        let _ = t.join();
-    }
-    
-    let final_info = info.lock().unwrap().clone();
-    
-    if !PROGRESSIVE_DISPLAY {
-        render_output(&final_info);
-    }
-    
-    if CACHE_ENABLED {
-        save_cache(&final_info);
+    // Save cache if enabled
+    if config.cache_enabled {
+        save_cache(&info, &config);
     }
 }
 
@@ -467,8 +679,8 @@ fn main() {
 // RENDERING
 // ============================================================================
 
-fn render_output(info: &Info) {
-    let cs = if USE_COLOR { ColorScheme::get() } else { ColorScheme::get() };
+fn render_output(info: &Info, config: &Config) {
+    let cs = ColorScheme::new(config);
     
     let logo_lines = if let Some(ref os) = info.os {
         get_logo(os)
@@ -478,90 +690,93 @@ fn render_output(info: &Info) {
     
     let mut info_lines = vec![];
     
+    // Header: user@hostname
     if let (Some(ref user), Some(ref host)) = (&info.user, &info.hostname) {
         info_lines.push(format!("{}{}@{}{}", cs.bold, user, host, cs.reset));
         info_lines.push("─".repeat(user.len() + host.len() + 1));
     }
     
-    if SHOW_OS {
+    // System information
+    if config.show_os {
         if let Some(ref os) = info.os {
             info_lines.push(format!("{}OS:{} {}", cs.primary, cs.reset, os));
         }
     }
     
-    if SHOW_KERNEL {
+    if config.show_kernel {
         if let Some(ref kernel) = info.kernel {
             info_lines.push(format!("{}Kernel:{} {}", cs.primary, cs.reset, kernel));
         }
     }
     
-    if SHOW_UPTIME {
+    if config.show_uptime {
         if let Some(ref uptime) = info.uptime {
             info_lines.push(format!("{}Uptime:{} {}", cs.primary, cs.reset, uptime));
         }
     }
     
-    if SHOW_BOOT_TIME {
+    if config.show_boot_time {
         if let Some(ref boot) = info.boot_time {
             info_lines.push(format!("{}Boot Time:{} {}", cs.primary, cs.reset, boot));
         }
     }
     
-    if SHOW_BOOTLOADER {
+    if config.show_bootloader {
         if let Some(ref bootloader) = info.bootloader {
             info_lines.push(format!("{}Bootloader:{} {}", cs.primary, cs.reset, bootloader));
         }
     }
     
-    if SHOW_PACKAGES {
+    if config.show_packages {
         if let Some(ref packages) = info.packages {
             info_lines.push(format!("{}Packages:{} {}", cs.primary, cs.reset, packages));
         }
     }
     
-    if SHOW_SHELL {
+    if config.show_shell {
         if let Some(ref shell) = info.shell {
             info_lines.push(format!("{}Shell:{} {}", cs.primary, cs.reset, shell));
         }
     }
     
-    if SHOW_DE {
+    if config.show_de {
         if let Some(ref de) = info.de {
             info_lines.push(format!("{}DE:{} {}", cs.primary, cs.reset, de));
         }
     }
     
-    if SHOW_WM {
+    if config.show_wm {
         if let Some(ref wm) = info.wm {
             info_lines.push(format!("{}WM:{} {}", cs.primary, cs.reset, wm));
         }
     }
     
-    if SHOW_INIT {
+    if config.show_init {
         if let Some(ref init) = info.init {
             info_lines.push(format!("{}Init:{} {}", cs.primary, cs.reset, init));
         }
     }
     
-    if SHOW_TERMINAL {
+    if config.show_terminal {
         if let Some(ref terminal) = info.terminal {
             info_lines.push(format!("{}Terminal:{} {}", cs.primary, cs.reset, terminal));
         }
     }
     
-    if SHOW_CPU {
+    if config.show_cpu {
         if let Some(ref cpu) = info.cpu {
             info_lines.push(format!("{}CPU:{} {}", cs.primary, cs.reset, cpu));
         }
     }
     
-    if SHOW_CPU_TEMP {
+    if config.show_cpu_temp {
         if let Some(ref temp) = info.cpu_temp {
             info_lines.push(format!("{}CPU Temp:{} {}", cs.primary, cs.reset, temp));
         }
     }
     
-    if SHOW_GPU {
+    // GPU info with inline temperature
+    if config.show_gpu {
         if let Some(ref gpus) = info.gpu {
             let temps = info.gpu_temps.as_ref();
             for (i, gpu) in gpus.iter().enumerate() {
@@ -579,47 +794,38 @@ fn render_output(info: &Info) {
         }
     }
     
-    if SHOW_GPU_TEMP {
-        // Temps are now shown inline with GPU info above
-    }
-    
-    if SHOW_MEMORY {
+    if config.show_memory {
         if let Some((used, total)) = info.memory {
             let percent = (used / total * 100.0) as u8;
-            let bar = create_bar(percent, &cs.secondary, &cs.muted);
+            let bar = create_bar(percent, &cs.secondary, &cs.muted, config.use_color);
             info_lines.push(format!("{}Memory:{} {:.1}GiB / {:.1}GiB {}",
                 cs.primary, cs.reset, used, total, bar));
         }
     }
     
-    if SHOW_SWAP {
+    if config.show_swap {
         if let Some((used, total)) = info.swap {
             if total > 0.0 {
                 let percent = (used / total * 100.0) as u8;
-                let bar = create_bar(percent, &cs.warning, &cs.muted);
+                let bar = create_bar(percent, &cs.warning, &cs.muted, config.use_color);
                 info_lines.push(format!("{}Swap:{} {:.1}GiB / {:.1}GiB {}",
                     cs.primary, cs.reset, used, total, bar));
             }
         }
     }
     
-    if SHOW_PARTITIONS {
+    if config.show_partitions {
         if let Some(ref parts) = info.partitions {
             for (dev, _mount, used, total) in parts {
                 let percent = if *total > 0.0 { (used / total * 100.0) as u8 } else { 0 };
-                let bar = create_bar(percent, &cs.secondary, &cs.muted);
+                let bar = create_bar(percent, &cs.secondary, &cs.muted, config.use_color);
                 info_lines.push(format!("{}Disk (/):{} {} - {:.1}GiB / {:.1}GiB {}",
                     cs.primary, cs.reset, dev, used, total, bar));
             }
         }
     }
     
-    if SHOW_DISKS_DETAILED {
-        // Skip showing raw disk info if we already showed partition info
-        // Raw disk info is less useful than partition usage
-    }
-    
-    if SHOW_NETWORK {
+    if config.show_network {
         if let Some(ref networks) = info.network {
             for net in networks {
                 let mut parts = vec![net.interface.clone()];
@@ -641,35 +847,46 @@ fn render_output(info: &Info) {
         }
     }
     
-    if SHOW_DISPLAY {
+    if config.show_display {
         if let Some(ref display) = info.display {
             info_lines.push(format!("{}Display:{} {}", cs.primary, cs.reset, display));
         }
     }
     
-    if SHOW_BATTERY {
+    if config.show_battery {
         if let Some((capacity, ref status)) = info.battery {
             let bar_color = if capacity > 50 { &cs.secondary } else if capacity > 20 { &cs.warning } else { &cs.error };
-            let bar = create_bar(capacity, bar_color, &cs.muted);
+            let bar = create_bar(capacity, bar_color, &cs.muted, config.use_color);
             info_lines.push(format!("{}Battery:{} {}% ({}) {}",
                 cs.primary, cs.reset, capacity, status, bar));
         }
     }
     
-    if SHOW_COLORS {
+    // Color palette display
+    if config.show_colors && config.use_color {
         info_lines.push(String::new());
         info_lines.push(format!("{}███{}███{}███{}███{}███{}███{}",
             cs.color1, cs.color2, cs.color3, cs.color4, cs.color5, cs.color6, cs.reset));
     }
     
+    // Render side-by-side
     let max_lines = std::cmp::max(logo_lines.len(), info_lines.len());
+    let logo_width = logo_lines.iter().map(|s| s.len()).max().unwrap_or(0);
+    
+    // Buffer stdout for performance
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut handle = std::io::BufWriter::new(stdout.lock());
     
     for i in 0..max_lines {
-        let logo_part = if i < logo_lines.len() {
-            format!("{}{}{}", cs.primary, logo_lines[i], cs.reset)
+        let (logo_content, logo_len) = if i < logo_lines.len() {
+            (logo_lines[i].as_str(), logo_lines[i].len())
         } else {
-            " ".repeat(15)
+            ("", 0)
         };
+        
+        let padding = " ".repeat(logo_width.saturating_sub(logo_len));
+        let logo_part = format!("{}{}{}{}", cs.primary, logo_content, cs.reset, padding);
         
         let info_part = if i < info_lines.len() {
             &info_lines[i]
@@ -677,19 +894,26 @@ fn render_output(info: &Info) {
             ""
         };
         
-        println!("{}  {}", logo_part, info_part);
+        writeln!(handle, "{}  {}", logo_part, info_part).unwrap_or(());
     }
 }
 
-fn create_bar(percent: u8, filled_color: &str, empty_color: &str) -> String {
+fn create_bar(percent: u8, filled_color: &str, empty_color: &str, use_color: bool) -> String {
     let filled = (percent as usize * PROGRESS_BAR_WIDTH) / 100;
     let empty = PROGRESS_BAR_WIDTH - filled;
-    format!("[{}{}{}{}{}]",
-        filled_color,
-        FILLED_CHAR.to_string().repeat(filled),
-        empty_color,
-        EMPTY_CHAR.to_string().repeat(empty),
-        "\x1b[0m")
+    
+    if use_color {
+        format!("[{}{}{}{}{}]",
+            filled_color,
+            FILLED_CHAR.to_string().repeat(filled),
+            empty_color,
+            EMPTY_CHAR.to_string().repeat(empty),
+            "\x1b[0m")
+    } else {
+        format!("[{}{}]",
+            FILLED_CHAR.to_string().repeat(filled),
+            EMPTY_CHAR.to_string().repeat(empty))
+    }
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -738,7 +962,10 @@ fn get_os() -> Option<String> {
 }
 
 fn get_kernel() -> Option<String> {
-    run_cmd("uname", &["-r"])
+    // Read directly from /proc instead of spawning uname - much faster
+    fs::read_to_string("/proc/sys/kernel/osrelease")
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn get_uptime() -> Option<String> {
@@ -764,14 +991,38 @@ fn get_boot_time() -> Option<String> {
     for line in stat.lines() {
         if line.starts_with("btime ") {
             let timestamp = line.split_whitespace().nth(1)?.parse::<i64>().ok()?;
-            
-            if let Some(output) = run_cmd("date", &["-d", &format!("@{}", timestamp), "+%Y-%m-%d %H:%M:%S"]) {
-                return Some(output);
-            }
+            // Format timestamp in pure Rust instead of calling date command
+            return Some(format_unix_timestamp(timestamp));
         }
     }
     
     None
+}
+
+// Pure Rust timestamp formatting (no external command needed)
+fn format_unix_timestamp(timestamp: i64) -> String {
+    const SECONDS_PER_DAY: i64 = 86400;
+    const DAYS_PER_400_YEARS: i64 = 146097;
+    const DAYS_SINCE_1970: i64 = 719468;
+    
+    let days = timestamp / SECONDS_PER_DAY + DAYS_SINCE_1970;
+    let time_of_day = timestamp % SECONDS_PER_DAY;
+    
+    let era = if days >= 0 { days } else { days - 146096 } / DAYS_PER_400_YEARS;
+    let doe = (days - era * DAYS_PER_400_YEARS) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+    
+    let hour = (time_of_day / 3600) % 24;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+    
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, m, d, hour, minute, second)
 }
 
 fn get_bootloader() -> Option<String> {
@@ -852,7 +1103,19 @@ fn get_bootloader() -> Option<String> {
 fn get_packages() -> Option<String> {
     let mut counts = vec![];
     
-    if let Some(count) = run_cmd("pacman", &["-Q"]).map(|s| s.lines().count()) {
+    // Fast path for Pacman: count directories in /var/lib/pacman/local
+    if let Ok(entries) = fs::read_dir("/var/lib/pacman/local") {
+        let count = entries.filter_map(Result::ok)
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .count();
+        if count > 0 {
+             // ALPM DB version is not a package, but usually 'local' contains only package dirs + 'ALPM_DB_VERSION'?
+             // Actually 'local' contains package directories. 'ALPM_DB_VERSION' might be a file?
+             // Checking file_type().is_dir() filters out files.
+            counts.push(format!("{} (pacman)", count));
+        }
+    } else if let Some(count) = run_cmd("pacman", &["-Q"]).map(|s| s.lines().count()) {
+         // Fallback to command if path is unreadable
         counts.push(format!("{} (pacman)", count));
     }
     if let Some(count) = run_cmd("dpkg", &["-l"]).map(|s| s.lines().filter(|l| l.starts_with("ii")).count()) {
@@ -1064,8 +1327,13 @@ fn get_gpu() -> Option<Vec<String>> {
     if gpus.is_empty() { None } else { Some(gpus) }
 }
 
-fn get_gpu_temp() -> Option<Vec<Option<String>>> {
-    let gpus = get_gpu()?;
+// Optimized version: accepts GPU list to avoid calling get_gpu() again
+fn get_gpu_temp_with_gpus(gpus: Option<&Vec<String>>) -> Option<Vec<Option<String>>> {
+    let gpus = gpus?;
+    if gpus.is_empty() {
+        return None;
+    }
+    
     let gpu_count = gpus.len();
     let mut gpu_temps: Vec<Option<String>> = vec![None; gpu_count];
     
@@ -1108,6 +1376,7 @@ fn get_gpu_temp() -> Option<Vec<Option<String>>> {
         }
     }
     
+    // NVIDIA requires nvidia-smi (only call if NVIDIA GPU detected)
     if has_nvidia {
         if let Some(output) = run_cmd("nvidia-smi", &["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"]) {
             for line in output.lines() {
@@ -1189,66 +1458,8 @@ fn read_file_trim(path: &str) -> Option<String> {
 }
 
 // ============================================================================
-// DISK INFORMATION
+// PARTITION INFORMATION
 // ============================================================================
-
-fn get_disks() -> Option<Vec<(String, f64, f64, f64, String)>> {
-    let mut disks = vec![];
-    let entries = fs::read_dir("/sys/block").ok()?;
-    
-    for entry in entries.flatten() {
-        let name = entry.file_name().to_string_lossy().to_string();
-        
-        if name.starts_with("loop") || name.starts_with("ram") {
-            continue;
-        }
-        
-        let size_path = format!("/sys/block/{}/size", name);
-        let size_str = read_file_trim(&size_path)?;
-        let blocks = size_str.parse::<u64>().ok()?;
-        let size_gib = (blocks * 512) as f64 / BYTES_TO_GIB;
-        
-        if size_gib < 1.0 {
-            continue;
-        }
-        
-        let is_rotational = read_file_trim(&format!("/sys/block/{}/queue/rotational", name))
-            .and_then(|s| s.parse::<u8>().ok())
-            .map(|v| v == 1)
-            .unwrap_or(false);
-        
-        let type_label = if name.starts_with("nvme") {
-            "NVME"
-        } else if name.starts_with("sd") {
-            if is_rotational { "HDD" } else { "SSD" }
-        } else if name.starts_with("mmc") {
-            "MMC"
-        } else if name.starts_with("zram") {
-            "SWAP"
-        } else {
-            "disk"
-        };
-        
-        let used_gib = if name.starts_with("zram") {
-            read_file_trim(&format!("/sys/block/{}/mm_stat", name))
-                .and_then(|stat| {
-                    stat.split_whitespace()
-                        .next()
-                        .and_then(|s| s.parse::<f64>().ok())
-                        .map(|bytes| bytes / BYTES_TO_GIB)
-                })
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-        
-        disks.push((name, size_gib, used_gib, size_gib, type_label.to_string()));
-        
-        if disks.len() >= 2 { break; }
-    }
-    
-    if disks.is_empty() { None } else { Some(disks) }
-}
 
 fn get_partitions() -> Option<Vec<(String, String, f64, f64)>> {
     if let Some(output) = run_cmd("df", &["-hT", "/"]) {
@@ -1436,20 +1647,459 @@ fn get_display() -> Option<String> {
 
 fn get_logo(os: &str) -> Vec<String> {
     let ol = os.to_lowercase();
-    let lines: &[&str] = if ol.contains("arch") || ol.contains("cachy") {
-        &["      /\\      ", "     /  \\     ", "    /\\   \\    ",
-          "   /  \\   \\   ", "  /    \\   \\  ", " /______\\___\\ "]
-    } else if ol.contains("ubuntu") {
-        &["         _     ", "     ---(_)    ", " _/  ---  \\    ",
-          "(_) |   |      ", "  \\  --- _/    ", "     ---(_)    "]
-    } else if ol.contains("debian") {
-        &["  _____  ", " /  __ \\ ", "|  /    |", "|  \\___- ", " -_      ", "   --_   "]
+    
+    // Specific distros first (before generic families)
+    let lines: &[&str] = if ol.contains("cachy") {
+        &[
+            r#"           .-------------------------:"#,
+            r#"          .+=========================."#,
+            r#"         :++===++==================-       :++-"#,
+            r#"        :*++====+++++=============-        .==:"#,
+            r#"       -*+++=====+***++==========:"#,
+            r#"      =*++++========------------:"#,
+            r#"     =*+++++=====-                     ..."#,
+            r#"   .+*+++++=-===:                    .=+++=:"#,
+            r#"  :++++=====-==:                     -*****+"#,
+            r#" :++========-=.                      .=+**+."#,
+            r#".+==========-.                          ."#,
+            r#" :+++++++====-                                .--==-."#,
+            r#"  :++==========.                             :+++++++:"#,
+            r#"   .-===========.                            =*****+*+"#,
+            r#"    .-===========:                           .+*****+:"#,
+            r#"      -=======++++:::::::::::::::::::::::::-:  .---:"#,
+            r#"       :======++++====+++******************=."#,
+            r#"        :=====+++==========++++++++++++++*-"#,
+            r#"         .====++==============++++++++++*-"#,
+            r#"          .===+==================+++++++:"#,
+            r#"           .-=======================+++:"#,
+            r#"             .........................."#,
+        ]
+    } else if ol.contains("bazzite") {
+        &[
+            r#"         ,....,          "#,
+            r#"       ,::::::<          "#,
+            r#"      ,::/^\/::.         "#,
+            r#"     ,::/   \::.         "#,
+            r#"    ,::/     \::.        "#,
+            r#"   ,::/       \::.       "#,
+            r#"   :::         :::       "#,
+            r#"   `::.       .::'       "#,
+            r#"     `::.   .::'         "#,
+            r#"       `:::::'           "#,
+            r#"         `'''            "#,
+        ]
+    } else if ol.contains("arch") || ol.contains("artix") || ol.contains("arco") {
+        &[
+            r#"                   -`                    "#,
+            r#"                  .o+`                   "#,
+            r#"                 `ooo/                   "#,
+            r#"                `+oooo:                  "#,
+            r#"               `+oooooo:                 "#,
+            r#"               -+oooooo+:                "#,
+            r#"             `/:-:++oooo+:               "#,
+            r#"            `/++++/+++++++:              "#,
+            r#"           `/++++++++++++++:             "#,
+            r#"          `/+++ooooooooooooo/`           "#,
+            r#"         ./ooosssso++osssssso+`          "#,
+            r#"        .oossssso-````/ossssss+`         "#,
+            r#"       -osssssso.      :ssssssso.        "#,
+            r#"      :osssssss/        osssso+++.       "#,
+            r#"     /ossssssss/        +ssssooo/-       "#,
+            r#"   `/ossssso+/:-        -:/+osssso+-     "#,
+            r#"  `+sso+:-`                 `.-/+oso:    "#,
+            r#" `++:.                           `-/+/   "#,
+            r#" .`                                 `/   "#,
+        ]
+    } else if ol.contains("ubuntu") || ol.contains("kubuntu") || ol.contains("xubuntu") || ol.contains("lubuntu") {
+        &[
+            r#"            .-/+oossssoo+/-.               "#,
+            r#"        `:+ssssssssssssssssss+:`           "#,
+            r#"      -+ssssssssssssssssssyyssss+-         "#,
+            r#"    .ossssssssssssssssssdMMMNysssso.       "#,
+            r#"   /ssssssssssshdmmNNmmyNMMMMhssssss/      "#,
+            r#"  +ssssssssshmydMMMMMMMNddddyssssssss+     "#,
+            r#" /sssssssshNMMMyhhyyyyhmNMMMNhssssssss/    "#,
+            r#" .ssssssssdMMMNhsssssssssshNMMMdssssssss.   "#,
+            r#" +sssshhhyNMMNyssssssssssssyNMMMysssssss+   "#,
+            r#" ossyNMMMNyMMhsssssssssssssshmmmhssssssso   "#,
+            r#" ossyNMMMNyMMhsssssssssssssshmmmhssssssso   "#,
+            r#" +sssshhhyNMMNyssssssssssssyNMMMysssssss+   "#,
+            r#" .ssssssssdMMMNhsssssssssshNMMMdssssssss.   "#,
+            r#"  /sssssssshNMMMyhhyyyyhdNMMMNhssssssss/    "#,
+            r#"   +ssssssssshmydMMMMMMMNddddyssssssss+     "#,
+            r#"    /ssssssssssshdmmNNmmyNMMMMhssssss/      "#,
+            r#"     .ossssssssssssssssssdMMMNysssso.       "#,
+            r#"       -+ssssssssssssssssssyyssss+-         "#,
+            r#"         `:+ssssssssssssssssss+:`           "#,
+            r#"             .-/+oossssoo+/-.               "#,
+        ]
+    } else if ol.contains("debian") || ol.contains("raspberry") || ol.contains("raspbian") {
+        &[
+            r#"       _,met$$$$$gg.           "#,
+            r#"    ,g$$$$$$$$$$$$$$$P.        "#,
+            r#"  ,g$$P"     """Y$$. ".     "#,
+            r#" ,$$P'              `$$$.      "#,
+            r#"',$$P       ,ggs.     `$$b:    "#,
+            r#"`d$$'     ,$P"'   .    $$$     "#,
+            r#" $$P      d$'     ,    $$P     "#,
+            r#" $$:      $$.   -    ,d$$'     "#,
+            r#" $$;      Y$b._   _,d$P'       "#,
+            r#" Y$$.    `.`"Y$$$$P"'          "#,
+            r#" `$$b      "-.__               "#,
+            r#"  `Y$$                         "#,
+            r#"   `Y$$.                       "#,
+            r#"     `$$b.                     "#,
+            r#"       `Y$$b.                  "#,
+            r#"          `"Y$b._              "#,
+            r#"              `"""             "#,
+        ]
     } else if ol.contains("fedora") {
-        &["      _____    ", "     /   __)\\  ", "     |  /  \\ \\ ",
-          "  ___|  |__/ / ", " / (_    _)_/  ", "/ /  |  |      "]
+        &[
+            r#"          /:-------------:\          "#,
+            r#"       :-------------------::        "#,
+            r#"     :-----------/shhOHbmp---:\      "#,
+            r#"   /-----------omMMMNNNMMD  ---:     "#,
+            r#"  :-----------sMMMMNMNMP.    ---:    "#,
+            r#" :-----------:MMMdP-------    ---\   "#,
+            r#",------------:MMMd--------    ---:   "#,
+            r#":------------:MMMd-------    .---:   "#,
+            r#":----    oNMMMMMMMMMNho     .----:   "#,
+            r#":--     .+shhhMMMmhhy++   .------/   "#,
+            r#":-    -------:MMMd--------------:    "#,
+            r#":-   --------/MMMd-------------;     "#,
+            r#":-    ------/hMMMy------------:      "#,
+            r#":-- :dMNdhhdNMMNo------------;       "#,
+            r#":---:sdNMMMMNds:------------:        "#,
+            r#":------:://:-------------::          "#,
+            r#":---------------------://            "#,
+        ]
+    } else if ol.contains("manjaro") {
+        &[
+            r#"██████████████████  ████████   "#,
+            r#"██████████████████  ████████   "#,
+            r#"██████████████████  ████████   "#,
+            r#"██████████████████  ████████   "#,
+            r#"████████            ████████   "#,
+            r#"████████  ████████  ████████   "#,
+            r#"████████  ████████  ████████   "#,
+            r#"████████  ████████  ████████   "#,
+            r#"████████  ████████  ████████   "#,
+            r#"████████  ████████  ████████   "#,
+            r#"████████  ████████  ████████   "#,
+            r#"████████  ████████  ████████   "#,
+            r#"████████  ████████  ████████   "#,
+            r#"████████  ████████  ████████   "#,
+        ]
+    } else if ol.contains("mint") {
+        &[
+            r#" MMMMMMMMMMMMMMMMMMMMMMMMMmds+.        "#,
+            r#" MMm----::-://////////////oymNMd+`     "#,
+            r#" MMd      /++                -sNMd:    "#,
+            r#" MMNso/`  dMM    `.::-. .-::.` .hMN:   "#,
+            r#" ddddMMh  dMM   :hNMNMNhNMNMNh: `NMm   "#,
+            r#"     NMm  dMM  .NMN/-+MMM+-/NMN` dMM   "#,
+            r#"     NMm  dMM  -MMm  `MMM   dMM. dMM   "#,
+            r#"     NMm  dMM  -MMm  `MMM   dMM. dMM   "#,
+            r#"     NMm  dMM  .mmd  `mmm   yMM. dMM   "#,
+            r#"     NMm  dMM`  ..`   ...   ydm. dMM   "#,
+            r#"     hMM- +MMd/-------...-:sdds  dMM   "#,
+            r#"     -NMm- :hNMNNNmdddddddddy/`  dMM   "#,
+            r#"      -dMNs-``-::::-------.``    dMM   "#,
+            r#"       `/dMNmy+/:.............:/yMMM   "#,
+            r#"          ./ydNMMMMMMMMMMMMMMMMMMMMM   "#,
+            r#"             \.MMMMMMMMMMMMMMMMMMM     "#,
+        ]
+    } else if ol.contains("pop") {
+        &[
+            r#"             /////////////                "#,
+            r#"         /////////////////////            "#,
+            r#"      ///////*767////////////////         "#,
+            r#"    //////7676767676*//////////////       "#,
+            r#"   /////76767//7676767//////////////      "#,
+            r#"  /////767676///*76767///////////////     "#,
+            r#" ///////767676///76767.///7676*///////    "#,
+            r#"/////////767676//76767///767676////////   "#,
+            r#"//////////76767676767////76767/////////   "#,
+            r#"///////////76767676//////7676//////////   "#,
+            r#"////////////,7676,///////767///////////   "#,
+            r#"/////////////*7676///////76////////////   "#,
+            r#"///////////////7676////////////////////   "#,
+            r#" ///////////////7676///767////////////    "#,
+            r#"  //////////////////////'////////////     "#,
+            r#"   //////.7676767676767676767//////       "#,
+            r#"    //////767676767676767676//////        "#,
+            r#"      ///////////////////////////         "#,
+            r#"         /////////////////////            "#,
+            r#"             /////////////                "#,
+        ]
+    } else if ol.contains("gentoo") {
+        &[
+            r#"         -/oyddmdhs+:.                "#,
+            r#"     -odNMMMMMMMMNNmhy+.              "#,
+            r#"   -yNMMMMMMMMNmhhyhs+:`              "#,
+            r#" -oNMMMMMMMMMNne`                     "#,
+            r#" `oNMMMMMMMMN- `                      "#,
+            r#"   `+yMMMMMMMm-                       "#,
+            r#"     `+hMMMMMMMc                      "#,
+            r#"       `oNMMMMMMd-                    "#,
+            r#"         `sNMMMMMMm+`                 "#,
+            r#"           `+dMMMMMMNho:              "#,
+            r#"             `+hMMMMMMMMNds+.         "#,
+            r#"               `+hNMMMMMMMMMMmy-      "#,
+            r#"                 `/dNMMMMMMMMMMMy`    "#,
+            r#"                   `:yNMMMMMMMMMMMs   "#,
+            r#"                     `:hNMMMMMMMMMM+  "#,
+        ]
+    } else if ol.contains("nixos") || ol.contains("nix") {
+        &[
+            r#"          \\  \\ //          "#,
+            r#"         ==\\__\\/ //        "#,
+            r#"           //   \\//         "#,
+            r#"        ==//     //==        "#,
+            r#"         //\\___//           "#,
+            r#"        // /\\  \\==         "#,
+            r#"          // \\              "#,
+        ]
+    } else if ol.contains("void") {
+        &[
+            r#"                __.,,------.._     "#,
+            r#"             ,'"   _      _   "`.  "#,
+            r#"            /.__, ._  -=- _"`    Y "#,
+            r#"           (.____.-.`      ""`   j "#,
+            r#"           VvvvvvV`.Y,.    _.,-'`  "#,
+            r#"              Y    ||,   '"\       "#,
+            r#"              |    ,'  ,     `-..  "#,
+            r#"              |  ,    o  ,  ,.'    "#,
+            r#"              | ;       /   ;      "#,
+            r#"              |  _  ,  /   ,       "#,
+            r#"              |,' .   :  ,         "#,
+            r#"              `--..__  `._`.._     "#,
+            r#"                     `--..____,    "#,
+        ]
+    } else if ol.contains("alpine") {
+        &[
+            r#"       .hddddddddddddddddddddddh.          "#,
+            r#"      :dddddddddddddddddddddddddd:         "#,
+            r#"     /dddddddddddddddddddddddddddd/        "#,
+            r#"    +dddddddddddddddddddddddddddddd+       "#,
+            r#"  `sdddddddddddddddddddddddddddddddds`     "#,
+            r#" `ydddddddddddd++hdddddddddddddddddddy`    "#,
+            r#" .hddddddddddd+`  `+ddddh:-sdddddddddddh.   "#,
+            r#" hdddddddddd+`      `+y:    .sddddddddddh   "#,
+            r#" ddddddddh+`   `//`   `.`     -sddddddddd   "#,
+            r#" ddddddh+`   `/hddh/`   `:s-    -sddddddd   "#,
+            r#" ddddh+`   `/+/dddddh/`   `+s-    -sddddd   "#,
+            r#" ddd+`   `/o` :dddddddh/`   `oy-    .yddd   "#,
+            r#" hdddyo+ohddyosdddddddddho+oydddy++ohdddh   "#,
+            r#" .hddddddddddddddddddddddddddddddddddddh.   "#,
+            r#"  `yddddddddddddddddddddddddddddddddddy`    "#,
+            r#"   `sdddddddddddddddddddddddddddddddds`     "#,
+            r#"     +dddddddddddddddddddddddddddddd+       "#,
+            r#"      /dddddddddddddddddddddddddddd/        "#,
+            r#"       :dddddddddddddddddddddddddd:         "#,
+            r#"        .hddddddddddddddddddddddh.          "#,
+        ]
+    } else if ol.contains("endeavour") || ol.contains("eos") {
+        &[
+            r#"                     ./o.                  "#,
+            r#"                   ./sssso-                "#,
+            r#"                 `:osssssss+-              "#,
+            r#"               `:+sssssssssso/.            "#,
+            r#"             `-/ossssssssssssso/.          "#,
+            r#"           `-/+sssssssssssssssso+:`        "#,
+            r#"         `-:/+sssssssssssssssssso+/.       "#,
+            r#"       `.://osssssssssssssssssssswo++-     "#,
+            r#"      .://+ssssssssssssssssssssssso++:     "#,
+            r#"    .:///ossssssssssssssssssssssssso++:    "#,
+            r#"  `:////ssssssssssssssssssssssssssso+++.   "#,
+            r#" `-////+ssssssssssssssssssssssssssso++++-   "#,
+            r#"  `..-+oosssssssssssssssssssssssso+++++/`   "#,
+            r#"    ./++++++++++++++++++++++++++++++/:.     "#,
+            r#"   `:::::::::::::::::::::::::------``       "#,
+        ]
+    } else if ol.contains("zorin") {
+        &[
+            r#"        `.:/++++++/-.`             "#,
+            r#"      .:/++++++++++++/:-           "#,
+            r#"    `:/++++++++++++++/++/.         "#,
+            r#"   `:/++++++++++++++//++/+`        "#,
+            r#"  .://++++++++++++++//++ /+        "#,
+            r#"  :://++++++++++++++/++  :+        "#,
+            r#"  /://+++++++++++++/++   :+        "#,
+            r#"  /://++++++++++++/++    :+        "#,
+            r#"  /://+++++++++++/++     :+        "#,
+            r#"  /://++++++++++/++      :+        "#,
+            r#"  /://+++++++++/++       :+        "#,
+            r#"  /://++++++++/++        :+        "#,
+            r#"  /://+++++++/++         :+        "#,
+            r#"  /://++++++/++          :+        "#,
+            r#"  /://+++++/++           :+        "#,
+            r#"  /://++++/++            :+        "#,
+            r#"  /://+++/++             :+        "#,
+            r#"  /://++/++              :+        "#,
+            r#"  /://+/++               :+        "#,
+            r#"  /://++`                .+        "#,
+            r#"   ++`                    `        "#,
+        ]
+    } else if ol.contains("kali") {
+        &[
+            r#"      ..............           "#,
+            r#"    ..`  `......`  `..         "#,
+            r#"  ..`  `.`......`.`  `..       "#,
+            r#" ..  `.`  `....`  `.`  ..      "#,
+            r#"..  `.` .` ... `. `.`  ..      "#,
+            r#"..  `.` `.`...`.` `.`  ..      "#,
+            r#" ..  `.`  `...`  `.`  ..       "#,
+            r#"  ..`  `.` `.` `. `  ..        "#,
+            r#"    ..`  `.` `.` ` ..          "#,
+            r#"      ..`  `.` `. `            "#,
+            r#"        ..`  ` .               "#,
+            r#"          ..`                  "#,
+            r#"            .                  "#,
+        ]
+    } else if ol.contains("garuda") {
+        &[
+            r#"             .           "#,
+            r#"           .d8l          "#,
+            r#"         .d8888l         "#,
+            r#"        .d888888l        "#,
+            r#"       .d88888888l       "#,
+            r#"      .d8888888888l      "#,
+            r#"     .d888888888888l     "#,
+            r#"    .d88888888888888l    "#,
+            r#"   .d8888888888888888l   "#,
+            r#"  .d888888888888888888l  "#,
+            r#" .d88888888888888888888l "#,
+            r#".d8888888888888888888888l"#,
+        ]
+    } else if ol.contains("elementary") {
+        &[
+            r#"         eeeeeeeeeeeeeeeee         "#,
+            r#"      eeeeeeeeeeeeeeeeeeeeeee      "#,
+            r#"    eeeee  eeeeeeeeeeee   eeeee    "#,
+            r#"  eeee   eeeee       eee     eeee  "#,
+            r#" eeee   eeee          eee     eeee "#,
+            r#"eee    eee            eee       eee"#,
+            r#"eee   eee            eee        eee"#,
+            r#"ee    eee           eeee       eeee"#,
+            r#"ee    eee         eeeee      eeeeee"#,
+            r#"ee    eee       eeeee      eeeee ee"#,
+            r#"eee   eeee   eeeeee      eeeee  eee"#,
+            r#"eee    eeeeeeeeee     eeeeee    eee"#,
+            r#" eeeeeeeeeeeeeeeeeeeeeeee    eeeee "#,
+            r#"  eeeeeeee eeeeeeeeeeee      eeee  "#,
+            r#"    eeeee                 eeeee    "#,
+            r#"      eeeeeee         eeeeeee      "#,
+            r#"         eeeeeeeeeeeeeeeee         "#,
+        ]
+    } else if ol.contains("solus") {
+        &[
+            r#"             `.-:-.`             "#,
+            r#"           ./++++++/-.           "#,
+            r#"         .:/+++++++++/-          "#,
+            r#"        -/++++++++++++/-         "#,
+            r#"      `./+++++++++++++++/.       "#,
+            r#"     .://+++++++++++++++//:.     "#,
+            r#"    .:/+++++++++++++++++++//:.   "#,
+            r#"   -///+++++++++++++++++++///-   "#,
+            r#"  `////+++++++++++++++++++////`  "#,
+            r#"  -////+++++++++++++++++++////-  "#,
+            r#"   -///+++++++++++++++++++///-   "#,
+            r#"    `://+++++++++++++++++//:`    "#,
+            r#"      `-://+++++++++++//:-`      "#,
+            r#"         `.-://///:-.`           "#,
+        ]
+    } else if ol.contains("centos") || ol.contains("rocky") || ol.contains("alma") || ol.contains("rhel") || ol.contains("red hat") {
+        &[
+            r#"           .          "#,
+            r#"          ..          "#,
+            r#"         .=.          "#,
+            r#"       .=: .          "#,
+            r#"     .==:  .=|.       "#,
+            r#"    .===:  .===.      "#,
+            r#"  .====:   .====.     "#,
+            r#" .=====.   .=====.    "#,
+            r#".======.   .======.   "#,
+            r#".======.   .======.   "#,
+            r#".======.   .======.   "#,
+            r#".======.   .======.   "#,
+            r#" .=====.   .=====.    "#,
+            r#"  .====:   .====.     "#,
+            r#"    .===:  .===.      "#,
+            r#"     .==:  .=|.       "#,
+            r#"       .=: .          "#,
+            r#"         .=.          "#,
+            r#"          ..          "#,
+            r#"           .          "#,
+        ]
+    } else if ol.contains("windows") || ol.contains("wsl") {
+        &[
+            r#"                                ..,  "#,
+            r#"                    ....,,:;+ccllll  "#,
+            r#"      ...,,+:;  cllllllllllllllllll  "#,
+            r#",cclllllllllll  lllllllllllllllllll  "#,
+            r#"llllllllllllll  lllllllllllllllllll  "#,
+            r#"llllllllllllll  lllllllllllllllllll  "#,
+            r#"llllllllllllll  lllllllllllllllllll  "#,
+            r#"llllllllllllll  lllllllllllllllllll  "#,
+            r#"                                     "#,
+            r#"llllllllllllll  lllllllllllllllllll  "#,
+            r#"llllllllllllll  lllllllllllllllllll  "#,
+            r#"llllllllllllll  lllllllllllllllllll  "#,
+            r#"llllllllllllll  lllllllllllllllllll  "#,
+            r#"llllllllllllll  lllllllllllllllllll  "#,
+            r#"`'ccllllllllll  lllllllllllllllllll  "#,
+            r#"       `' \*::  :ccllllllllllllllll  "#,
+            r#"                       ````''*::cll  "#,
+        ]
+    } else if ol.contains("android") || ol.contains("termux") {
+        &[
+            r#"      -o          o-       "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+            r#"     +hyd.      .dhy+      "#,
+        ]
+    } else if ol.contains("freebsd") {
+        &[
+            r#"   /\,-''''-.    "#,
+            r#"  \_)       \   "#,
+            r#"  |         |   "#,
+            r#"  |  FreeBSD|   "#,
+            r#"   ;        /    "#,
+            r#"    '-....--'    "#,
+        ]
     } else {
-        &["   ┌─────┐   ", "   │ ● ● │   ", "   │  ◉  │   ",
-          "   │ ─── │   ", "   └─────┘   ", "             "]
+        // Generic Linux Tux (neofetch style)
+        &[
+            r#"         _nnnn_        "#,
+            r#"        dGGGGMMb       "#,
+            r#"       @p~qp~~qMb      "#,
+            r#"       M|@||@) M|      "#,
+            r#"       @,----.JM|      "#,
+            r#"      JS^\__/  qKL     "#,
+            r#"     dZP        qKRb   "#,
+            r#"    dZP          qKKb  "#,
+            r#"   fZP            SMMb "#,
+            r#"   HZM            MMMM "#,
+            r#"   FqM            MMMM "#,
+            r#" __| ".        |\dS"qML"#,
+            r#" |    `.       | `' \Zq"#,
+            r#"_)      \.___.,|     .'"#,
+            r#"\____   )MMMMMP|   .'  "#,
+            r#"     `-'       `--'    "#,
+        ]
     };
     
     lines.iter().map(|&s| s.to_string()).collect()
