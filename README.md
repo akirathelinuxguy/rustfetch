@@ -1,14 +1,14 @@
 # rustfetch
 
-A minimal yet highly customizable system information fetcher written in Rust. Supports Linux, BSD, and macOS, with GPU detection and OS-specific icons. No external dependencies, easy to extend and configure. WHICH USES RUST BTW
+A minimal yet highly customizable system information fetcher written in Rust. Supports Linux, BSD(should do but havent tested personally), and macOS ( not tested as im to broke for mac os), with GPU detection and OS-specific icons. No external dependencies, easy to extend and configure.
 
 ---
 
 
 ## Features
-- **System Info**: Hostname, OS, kernel, CPU, memory, uptime, boot time
-- **GPU Detection**: Supports Linux/BSD/macOS with temperature monitoring
-- **Bootloader Detection**: Limine, GRUB, systemd-boot, Windows Boot Manager, rEFInd, etc.
+- **System Info**:  OS, kernel, CPU, memory, uptime, boot time
+- **GPU Detection**: Supports Linux/with temperature monitoring
+- **Bootloader Detection**: Limine, GRUB, systemd-boot  
 - **Storage**: Disk usage and partitions with progress bars
 - **Network**: IP address and interface
 - **Battery**: Percentage and charging status
@@ -44,7 +44,6 @@ rustc -C opt-level=3 -C target-cpu=native -C lto=fat rustfetch.rs
 
 ---
 
-## Customization
 
 
 ## Configuration
@@ -80,7 +79,7 @@ You can also add or modify OS logos in the `get_os_icon()` function for more per
 
 ## License
 
-This project is licensed under the MIT License idk why it just seems better. See `LICENSE` for details.
+This project is licensed under the MIT License idk why it just seems better as its mainly hobby code . See `LICENSE` for details.
 
 ---
 
@@ -93,11 +92,11 @@ This project is licensed under the MIT License idk why it just seems better. See
 
 ## Contributing
 
-Contributions are welcome! Feel free to fork and extend the project.
+Contributions are welcome! Feel free to fork and extend the project. but keep it pure rust no libs and sub 10,000 lines if possible
 
 ---
 
 ## Contact Me 
-Do it via issues like a normal person or email me at reubenpercival14@gmail.com
+Do it via issues like a normal person or email me at reubenpercival14@gmail.com i always respond
 
 
