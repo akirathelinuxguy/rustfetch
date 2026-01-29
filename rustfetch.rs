@@ -4,14 +4,25 @@ use std::{
     path::Path,
     process::Command,
     thread,
+    collections::HashMap,
 };
 
 // ============================================================================
 // VERSION INFO
 // ============================================================================
 
-const VERSION: &str = "0.1.1";
+const VERSION: &str = "0.1.2";
 const PROGRAM_NAME: &str = "rustfetch";
+
+macro_rules! module {
+    ($info_lines:expr, $config_field:expr, $label:expr, $value:expr, $cs:expr) => {
+        if $config_field {
+            if let Some(ref val) = $value {
+                $info_lines.push(format!("{}{}:{} {}", $cs.primary, $label, $cs.reset, val));
+            }
+        }
+    };
+}
 
 // ============================================================================
 // CLI ARGUMENT PARSING
@@ -44,6 +55,23 @@ struct Config {
     show_display: bool,
     show_battery: bool,
     show_colors: bool,
+    show_model: bool,
+    show_motherboard: bool,
+    show_bios: bool,
+    show_theme: bool,
+    show_icons: bool,
+    show_font: bool,
+    show_processes: bool,
+    show_cpu_freq: bool,
+    show_locale: bool,
+    show_public_ip: bool,
+    show_cpu_cores: bool,
+    show_cpu_cache: bool,
+    show_gpu_vram: bool,
+    show_resolution: bool,
+    show_entropy: bool,
+    show_users: bool,
+    show_failed_units: bool,
 }
 
 impl Default for Config {
@@ -74,6 +102,23 @@ impl Default for Config {
             show_display: true,
             show_battery: true,
             show_colors: true,
+            show_model: true,
+            show_motherboard: true,
+            show_bios: true,
+            show_theme: true,
+            show_icons: true,
+            show_font: true,
+            show_processes: true,
+            show_cpu_freq: true,
+            show_locale: true,
+            show_public_ip: false,
+            show_cpu_cores: true,
+            show_cpu_cache: true,
+            show_gpu_vram: true,
+            show_resolution: true,
+            show_entropy: true,
+            show_users: true,
+            show_failed_units: true,
         }
     }
 }
@@ -87,26 +132,19 @@ USAGE:
 
 OPTIONS:
     -h, --help          Show this help message
-    -h, --help          Show this help message
     -j, --json          Output system info as JSON
     -n, --no-color      Disable colored output
     -t, --theme <NAME>  Set color theme (classic, pastel, gruvbox, nord, dracula)
     --no-cache          Disable caching
 
 MODULES:
-    --os / --no-os
-    --kernel / --no-kernel
-    --uptime / --no-uptime
-    --cpu / --no-cpu
-    --memory / --no-memory
-    --gpu / --no-gpu
-    --shell / --no-shell
-    --terminal / --no-terminal
-    --packages / --no-packages
-    --disk / --no-disk
-    --network / --no-network
-    --battery / --no-battery
-    (All modules enabled by default)
+    --os / --kernel / --uptime / --boot / --packages
+    --cpu / --gpu / --memory / --swap / --disk
+    --shell / --terminal / --de / --wm / --init
+    --model / --mobo / --bios / --locale / --public-ip
+    --desktop-theme / --icons / --font / --resolution / --entropy
+    --network / --battery / --users / --failed
+    (Most modules enabled by default)
 
 EXAMPLES:
     {}              Show system info with default settings
@@ -206,6 +244,40 @@ fn parse_args() -> Option<Config> {
             "--no-battery" => config.show_battery = false,
             "--colors" => config.show_colors = true,
             "--no-colors" => config.show_colors = false,
+            "--model" => config.show_model = true,
+            "--no-model" => config.show_model = false,
+            "--mobo" | "--motherboard" => config.show_motherboard = true,
+            "--no-mobo" | "--no-motherboard" => config.show_motherboard = false,
+            "--bios" => config.show_bios = true,
+            "--no-bios" => config.show_bios = false,
+            "--desktop-theme" => config.show_theme = true,
+            "--no-desktop-theme" => config.show_theme = false,
+            "--icons" => config.show_icons = true,
+            "--no-icons" => config.show_icons = false,
+            "--font" => config.show_font = true,
+            "--no-font" => config.show_font = false,
+            "--processes" => config.show_processes = true,
+            "--no-processes" => config.show_processes = false,
+            "--cpu-freq" => config.show_cpu_freq = true,
+            "--no-cpu-freq" => config.show_cpu_freq = false,
+            "--locale" => config.show_locale = true,
+            "--no-locale" => config.show_locale = false,
+            "--public-ip" => config.show_public_ip = true,
+            "--no-public-ip" => config.show_public_ip = false,
+            "--cores" => config.show_cpu_cores = true,
+            "--no-cores" => config.show_cpu_cores = false,
+            "--cache" => config.show_cpu_cache = true,
+            "--no-cache-module" => config.show_cpu_cache = false,
+            "--vram" => config.show_gpu_vram = true,
+            "--no-vram" => config.show_gpu_vram = false,
+            "--resolution" => config.show_resolution = true,
+            "--no-resolution" => config.show_resolution = false,
+            "--entropy" => config.show_entropy = true,
+            "--no-entropy" => config.show_entropy = false,
+            "--users" => config.show_users = true,
+            "--no-users" => config.show_users = false,
+            "--failed" => config.show_failed_units = true,
+            "--no-failed" => config.show_failed_units = false,
             
             arg if arg.starts_with('-') => {
                 eprintln!("Unknown option: {}", arg);
@@ -225,7 +297,7 @@ fn parse_args() -> Option<Config> {
 // ============================================================================
 
 const CACHE_FILE: &str = "/tmp/rustfetch_cache";
-const PROGRESS_BAR_WIDTH: usize = 20;
+
 
 
 
@@ -438,22 +510,29 @@ struct NetworkInfo {
     state: String,
     rx_bytes: Option<u64>,
     tx_bytes: Option<u64>,
+    rx_rate_mbs: Option<f64>,
+    tx_rate_mbs: Option<f64>,
+    ping: Option<f64>,
+    jitter: Option<f64>,
+    packet_loss: Option<f64>,
 }
 
 impl ToJson for NetworkInfo {
     fn to_json(&self) -> String {
-        let rx = self.rx_bytes.map(|v| v.to_string()).unwrap_or("null".to_string());
-        let tx = self.tx_bytes.map(|v| v.to_string()).unwrap_or("null".to_string());
-        
         format!(
-            "{{\"interface\":{},\"ipv4\":{},\"ipv6\":{},\"mac\":{},\"state\":{},\"rx_bytes\":{},\"tx_bytes\":{}}}",
+            "{{\"interface\":{},\"ipv4\":{},\"ipv6\":{},\"mac\":{},\"state\":{},\"rx_bytes\":{},\"tx_bytes\":{},\"rx_rate_mbs\":{},\"tx_rate_mbs\":{},\"ping\":{},\"jitter\":{},\"packet_loss\":{}}}",
             self.interface.to_json(),
             self.ipv4.to_json(),
             self.ipv6.to_json(),
             self.mac.to_json(),
             self.state.to_json(),
-            rx,
-            tx
+            self.rx_bytes.to_json(),
+            self.tx_bytes.to_json(),
+            self.rx_rate_mbs.to_json(),
+            self.tx_rate_mbs.to_json(),
+            self.ping.to_json(),
+            self.jitter.to_json(),
+            self.packet_loss.to_json(),
         )
     }
 }
@@ -464,6 +543,14 @@ struct Info {
     hostname: Option<String>,
     os: Option<String>,
     kernel: Option<String>,
+    public_ip: Option<String>,
+    cpu_cores: Option<(usize, usize)>,
+    cpu_cache: Option<String>,
+    gpu_vram: Option<Vec<String>>,
+    resolution: Option<String>,
+    entropy: Option<String>,
+    users: Option<usize>,
+    failed_units: Option<usize>,
     uptime: Option<String>,
     boot_time: Option<String>,
     bootloader: Option<String>,
@@ -483,6 +570,15 @@ struct Info {
     network: Option<Vec<NetworkInfo>>,
     display: Option<String>,
     battery: Option<(u8, String)>,
+    model: Option<String>,
+    motherboard: Option<String>,
+    bios: Option<String>,
+    theme: Option<String>,
+    icons: Option<String>,
+    font: Option<String>,
+    processes: Option<usize>,
+    cpu_freq: Option<String>,
+    locale: Option<String>,
 }
 
 impl ToJson for Info {
@@ -557,6 +653,17 @@ impl ToJson for Info {
             parts.push(format!("\"battery\":{{\"capacity\":{},\"status\":{}}}", cap, status.to_json()));
         }
         
+        if let Some(ref v) = self.model { parts.push(format!("\"model\":{}", v.to_json())); }
+        if let Some(ref v) = self.motherboard { parts.push(format!("\"motherboard\":{}", v.to_json())); }
+        if let Some(ref v) = self.bios { parts.push(format!("\"bios\":{}", v.to_json())); }
+        if let Some(ref v) = self.theme { parts.push(format!("\"theme\":{}", v.to_json())); }
+        if let Some(ref v) = self.icons { parts.push(format!("\"icons\":{}", v.to_json())); }
+        if let Some(ref v) = self.font { parts.push(format!("\"font\":{}", v.to_json())); }
+        if let Some(ref v) = self.processes { parts.push(format!("\"processes\":{}", v)); }
+        if let Some(ref v) = self.cpu_freq { parts.push(format!("\"cpu_freq\":{}", v.to_json())); }
+        if let Some(ref v) = self.locale { parts.push(format!("\"locale\":{}", v.to_json())); }
+        if let Some(ref v) = self.public_ip { parts.push(format!("\"public_ip\":{}", v.to_json())); }
+        
         format!("{{{}}}", parts.join(","))
     }
 }
@@ -584,9 +691,12 @@ fn main() {
         None => return,
     };
     
+    let start_time = std::time::Instant::now();
+    let net_start = read_file_trim("/proc/net/dev");
+
     // Use thread::scope for automatic join and no Arc overhead
     let info = thread::scope(|s| {
-        // Thread 1: Fast file reads (no external commands)
+        // Thread 1: System info & Theme
         let t1 = s.spawn(|| {
             let user = get_user();
             let hostname = get_hostname();
@@ -598,67 +708,69 @@ fn main() {
             let init = get_init();
             let terminal = get_terminal();
             let display = get_display();
-            (user, hostname, os, kernel, uptime, shell, de, init, terminal, display)
+            let model = get_model();
+            let motherboard = get_motherboard();
+            let bios = get_bios();
+            let locale = get_locale();
+            let theme_info = get_theme_info();
+            let resolution = get_resolution();
+            (user, hostname, os, kernel, uptime, shell, de, init, terminal, display, model, motherboard, bios, locale, theme_info, resolution)
         });
         
-        // Thread 2: Hardware info (CPU, memory, temps - all from /proc and /sys)
+        // Thread 2: Hardware stats (CPU/Mem/Battery)
         let t2 = s.spawn(|| {
             let cpu = get_cpu();
             let cpu_temp = get_cpu_temp();
+            let cpu_cores = get_cpu_cores();
+            let cpu_cache = get_cpu_cache();
+            let cpu_freq = get_cpu_freq();
             let memory = get_memory();
             let swap = get_swap();
             let battery = get_battery();
-            (cpu, cpu_temp, memory, swap, battery)
+            let processes = get_processes();
+            let users = get_users_count();
+            let entropy = get_entropy();
+            (cpu, cpu_temp, cpu_cores, cpu_cache, cpu_freq, memory, swap, battery, processes, users, entropy)
         });
         
-        // Thread 3: GPU info (requires lspci - expensive, do once)
+        // Thread 3: GPU info
         let t3 = s.spawn(|| {
             let gpus = get_gpu();
             let gpu_temps = get_gpu_temp_with_gpus(gpus.as_ref());
-            (gpus, gpu_temps)
+            let gpu_vram = get_gpu_vram();
+            (gpus, gpu_temps, gpu_vram)
         });
         
-        // Thread 4: External commands (slowest - packages, network, disk, boot info)
+        // Thread 4: Network & Misc
         let t4 = s.spawn(|| {
             let packages = get_packages();
-            let partitions = get_partitions();
-            let network = get_network();
+            let partitions = get_partitions_impl();
             let boot_time = get_boot_time();
             let bootloader = get_bootloader();
             let wm = get_wm();
-            (packages, partitions, network, boot_time, bootloader, wm)
+            let public_ip = get_public_ip();
+            let failed_units = get_failed_units();
+            (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units)
         });
         
-        // Collect results (no mutex needed with scope)
-        let (user, hostname, os, kernel, uptime, shell, de, init, terminal, display) = t1.join().unwrap();
-        let (cpu, cpu_temp, memory, swap, battery) = t2.join().unwrap();
-        let (gpu, gpu_temps) = t3.join().unwrap();
-        let (packages, partitions, network, boot_time, bootloader, wm) = t4.join().unwrap();
+        // Collect results
+        let (user, hostname, os, kernel, uptime, shell, de, init, terminal, display, model, motherboard, bios, locale, theme_info, resolution) = t1.join().unwrap();
+        let (cpu, cpu_temp, cpu_cores, cpu_cache, cpu_freq, memory, swap, battery, processes, users, entropy) = t2.join().unwrap();
+        let (gpu, gpu_temps, gpu_vram) = t3.join().unwrap();
+        let (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units) = t4.join().unwrap();
         
+        let delta = start_time.elapsed().as_secs_f64();
+        let network = get_network_final(net_start, delta);
+
         Info {
-            user,
-            hostname,
-            os,
-            kernel,
-            uptime,
-            boot_time,
-            bootloader,
-            packages,
-            shell,
-            de,
-            wm,
-            init,
-            terminal,
-            cpu,
-            cpu_temp,
-            gpu,
-            gpu_temps,
-            memory,
-            swap,
-            partitions,
-            network,
-            display,
-            battery,
+            user, hostname, os, kernel, uptime, shell, de, wm, init, terminal,
+            cpu, cpu_temp, cpu_cores, cpu_cache, cpu_freq,
+            gpu, gpu_temps, gpu_vram,
+            memory, swap, partitions, network, display, battery,
+            model, motherboard, bios,
+            theme: theme_info.theme, icons: theme_info.icons, font: theme_info.font,
+            processes, users, entropy, locale, public_ip, resolution, failed_units,
+            boot_time, bootloader, packages,
         }
     });
     
@@ -676,11 +788,72 @@ fn main() {
 }
 
 // ============================================================================
+// RENDERING UTILS
+// ============================================================================
+
+fn get_terminal_width() -> usize {
+    env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .or_else(|| {
+            run_cmd("tput", &["cols"]).and_then(|s| s.parse().ok())
+        })
+        .unwrap_or(80)
+}
+
+fn visible_len(s: &str) -> usize {
+    let mut len = 0;
+    let mut in_ansi = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_ansi = true;
+        } else if in_ansi {
+            if c.is_ascii_alphabetic() {
+                in_ansi = false;
+            }
+        } else {
+            len += 1;
+        }
+    }
+    len
+}
+
+fn truncate_ansi(s: &str, max_width: usize) -> String {
+    let mut current_width = 0;
+    let mut result = String::new();
+    let mut in_ansi = false;
+    
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_ansi = true;
+            result.push(c);
+        } else if in_ansi {
+            result.push(c);
+            if c.is_ascii_alphabetic() {
+                in_ansi = false;
+            }
+        } else {
+            if current_width < max_width {
+                result.push(c);
+                current_width += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    if !result.is_empty() && s.contains('\x1b') {
+        result.push_str("\x1b[0m");
+    }
+    result
+}
+
+// ============================================================================
 // RENDERING
 // ============================================================================
 
 fn render_output(info: &Info, config: &Config) {
     let cs = ColorScheme::new(config);
+    let term_width = get_terminal_width();
     
     let logo_lines = if let Some(ref os) = info.os {
         get_logo(os)
@@ -688,84 +861,70 @@ fn render_output(info: &Info, config: &Config) {
         get_logo("unknown")
     };
     
+    // Use trimmed logo lines to save horizontal space
+    let logo_width = logo_lines.iter().map(|s| visible_len(s.trim_end())).max().unwrap_or(0);
+    
+    // Calculate available width for info (forced side-by-side)
+    // We use a high minimum (60) because some terminals report width incorrectly (e.g. 26)
+    // This ensures info is shown fully unless the terminal is *actually* physically too small.
+    let available_info_width = term_width.saturating_sub(logo_width + 2).max(60);
+
+    // Dynamic bar width
+    let bar_width = (available_info_width.saturating_sub(40)).clamp(2, 25);
+    
     let mut info_lines = vec![];
     
-    // Header: user@hostname
+    // Header: user@hostname with vibrant effect
     if let (Some(ref user), Some(ref host)) = (&info.user, &info.hostname) {
-        info_lines.push(format!("{}{}@{}{}", cs.bold, user, host, cs.reset));
-        info_lines.push("─".repeat(user.len() + host.len() + 1));
+        let separator = "─".repeat(user.len() + host.len() + 1);
+        info_lines.push(format!("{}{}{}@{}", cs.bold, cs.primary, user, host));
+        info_lines.push(format!("{}{}{}", cs.muted, separator, cs.reset));
     }
     
     // System information
-    if config.show_os {
-        if let Some(ref os) = info.os {
-            info_lines.push(format!("{}OS:{} {}", cs.primary, cs.reset, os));
+    module!(info_lines, config.show_os, "OS", info.os, cs);
+    module!(info_lines, config.show_kernel, "Kernel", info.kernel, cs);
+    module!(info_lines, config.show_uptime, "Uptime", info.uptime, cs);
+    module!(info_lines, config.show_boot_time, "Boot", info.boot_time, cs);
+    
+    if config.show_failed_units {
+        if let Some(failed) = info.failed_units {
+            if failed > 0 {
+                info_lines.push(format!("{}Failed Units:{} {}", cs.warning, cs.reset, failed));
+            }
         }
     }
     
-    if config.show_kernel {
-        if let Some(ref kernel) = info.kernel {
-            info_lines.push(format!("{}Kernel:{} {}", cs.primary, cs.reset, kernel));
-        }
-    }
+    module!(info_lines, config.show_bootloader, "Bootloader", info.bootloader, cs);
     
-    if config.show_uptime {
-        if let Some(ref uptime) = info.uptime {
-            info_lines.push(format!("{}Uptime:{} {}", cs.primary, cs.reset, uptime));
-        }
-    }
-    
-    if config.show_boot_time {
-        if let Some(ref boot) = info.boot_time {
-            info_lines.push(format!("{}Boot Time:{} {}", cs.primary, cs.reset, boot));
-        }
-    }
-    
-    if config.show_bootloader {
-        if let Some(ref bootloader) = info.bootloader {
-            info_lines.push(format!("{}Bootloader:{} {}", cs.primary, cs.reset, bootloader));
-        }
-    }
-    
-    if config.show_packages {
-        if let Some(ref packages) = info.packages {
-            info_lines.push(format!("{}Packages:{} {}", cs.primary, cs.reset, packages));
-        }
-    }
-    
-    if config.show_shell {
-        if let Some(ref shell) = info.shell {
-            info_lines.push(format!("{}Shell:{} {}", cs.primary, cs.reset, shell));
-        }
-    }
-    
-    if config.show_de {
-        if let Some(ref de) = info.de {
-            info_lines.push(format!("{}DE:{} {}", cs.primary, cs.reset, de));
-        }
-    }
-    
-    if config.show_wm {
-        if let Some(ref wm) = info.wm {
-            info_lines.push(format!("{}WM:{} {}", cs.primary, cs.reset, wm));
-        }
-    }
-    
-    if config.show_init {
-        if let Some(ref init) = info.init {
-            info_lines.push(format!("{}Init:{} {}", cs.primary, cs.reset, init));
-        }
-    }
-    
-    if config.show_terminal {
-        if let Some(ref terminal) = info.terminal {
-            info_lines.push(format!("{}Terminal:{} {}", cs.primary, cs.reset, terminal));
-        }
-    }
-    
+    module!(info_lines, config.show_packages, "Packages", info.packages, cs);
+    module!(info_lines, config.show_shell, "Shell", info.shell, cs);
+    module!(info_lines, config.show_de, "DE", info.de, cs);
+    module!(info_lines, config.show_wm, "WM", info.wm, cs);
+    module!(info_lines, config.show_init, "Init", info.init, cs);
+    module!(info_lines, config.show_terminal, "Terminal", info.terminal, cs);
+    module!(info_lines, config.show_processes, "Processes", info.processes.map(|x| x.to_string()), cs);
+    module!(info_lines, config.show_users, "Users", info.users.map(|x| x.to_string()), cs);
+    module!(info_lines, config.show_entropy, "Entropy", info.entropy, cs);
+    module!(info_lines, config.show_model, "Model", info.model, cs);
+    module!(info_lines, config.show_motherboard, "Mobo", info.motherboard, cs);
+    module!(info_lines, config.show_bios, "BIOS", info.bios, cs);
+
     if config.show_cpu {
         if let Some(ref cpu) = info.cpu {
-            info_lines.push(format!("{}CPU:{} {}", cs.primary, cs.reset, cpu));
+            let mut details = vec![];
+            if config.show_cpu_freq {
+                if let Some(ref f) = info.cpu_freq { details.push(f.clone()); }
+            }
+            if config.show_cpu_cores {
+                if let Some((c, t)) = info.cpu_cores { details.push(format!("{}C/{}T", c, t)); }
+            }
+            if config.show_cpu_cache {
+                if let Some(ref cache) = info.cpu_cache { details.push(format!("{} L3", cache)); }
+            }
+            
+            let detail_str = if details.is_empty() { String::new() } else { format!(" ({})", details.join(", ")) };
+            info_lines.push(format!("{}CPU:{} {}{}", cs.primary, cs.reset, cpu, detail_str));
         }
     }
     
@@ -775,21 +934,21 @@ fn render_output(info: &Info, config: &Config) {
         }
     }
     
-    // GPU info with inline temperature
     if config.show_gpu {
         if let Some(ref gpus) = info.gpu {
             let temps = info.gpu_temps.as_ref();
             for (i, gpu) in gpus.iter().enumerate() {
-                let temp_str = if let Some(temps_vec) = temps {
-                    if let Some(Some(ref temp)) = temps_vec.get(i) {
-                        format!(" ({})", temp)
-                    } else {
-                        String::new()
+                let mut details = vec![];
+                if let Some(temps_vec) = temps {
+                    if let Some(Some(ref temp)) = temps_vec.get(i) { details.push(temp.clone()); }
+                }
+                if config.show_gpu_vram {
+                    if let Some(ref vram_vec) = info.gpu_vram {
+                        if let Some(vram) = vram_vec.get(i) { details.push(vram.clone()); }
                     }
-                } else {
-                    String::new()
-                };
-                info_lines.push(format!("{}GPU:{} {}{}", cs.primary, cs.reset, gpu, temp_str));
+                }
+                let detail_str = if details.is_empty() { String::new() } else { format!(" ({})", details.join(", ")) };
+                info_lines.push(format!("{}GPU:{} {}{}", cs.primary, cs.reset, gpu, detail_str));
             }
         }
     }
@@ -797,7 +956,7 @@ fn render_output(info: &Info, config: &Config) {
     if config.show_memory {
         if let Some((used, total)) = info.memory {
             let percent = (used / total * 100.0) as u8;
-            let bar = create_bar(percent, &cs.secondary, &cs.muted, config.use_color);
+            let bar = create_bar(percent, &cs.secondary, &cs.muted, config.use_color, bar_width);
             info_lines.push(format!("{}Memory:{} {:.1}GiB / {:.1}GiB {}",
                 cs.primary, cs.reset, used, total, bar));
         }
@@ -807,7 +966,7 @@ fn render_output(info: &Info, config: &Config) {
         if let Some((used, total)) = info.swap {
             if total > 0.0 {
                 let percent = (used / total * 100.0) as u8;
-                let bar = create_bar(percent, &cs.warning, &cs.muted, config.use_color);
+                let bar = create_bar(percent, &cs.warning, &cs.muted, config.use_color, bar_width);
                 info_lines.push(format!("{}Swap:{} {:.1}GiB / {:.1}GiB {}",
                     cs.primary, cs.reset, used, total, bar));
             }
@@ -816,11 +975,11 @@ fn render_output(info: &Info, config: &Config) {
     
     if config.show_partitions {
         if let Some(ref parts) = info.partitions {
-            for (dev, _mount, used, total) in parts {
+            for (_, mount, used, total) in parts {
                 let percent = if *total > 0.0 { (used / total * 100.0) as u8 } else { 0 };
-                let bar = create_bar(percent, &cs.secondary, &cs.muted, config.use_color);
-                info_lines.push(format!("{}Disk (/):{} {} - {:.1}GiB / {:.1}GiB {}",
-                    cs.primary, cs.reset, dev, used, total, bar));
+                let bar = create_bar(percent, &cs.secondary, &cs.muted, config.use_color, bar_width);
+                info_lines.push(format!("{}Disk ({}):{} {:.1}GiB / {:.1}GiB {}",
+                    cs.primary, mount, cs.reset, used, total, bar));
             }
         }
     }
@@ -829,58 +988,61 @@ fn render_output(info: &Info, config: &Config) {
         if let Some(ref networks) = info.network {
             for net in networks {
                 let mut parts = vec![net.interface.clone()];
-                
-                if let Some(ref ip) = net.ipv4 {
-                    parts.push(ip.clone());
+                if let Some(ref ip) = net.ipv4 { parts.push(ip.clone()); }
+                if let Some(p) = net.ping {
+                    let j = net.jitter.map(|j| format!(" | ±{:.1}ms", j)).unwrap_or_default();
+                    let l = net.packet_loss.map(|l| format!(" | {:.0}% loss", l)).unwrap_or_default();
+                    parts.push(format!("[{:.1}ms{}{}]", p, j, l));
                 }
-                
-                if net.state != "UP" {
-                    parts.push(format!("({})", net.state));
-                }
-                
-                if let (Some(rx), Some(tx)) = (net.rx_bytes, net.tx_bytes) {
+                if let (Some(rx), Some(tx)) = (net.rx_rate_mbs, net.tx_rate_mbs) {
+                    if rx > 0.01 || tx > 0.01 { parts.push(format!("↓{:.2}MB/s ↑{:.2}MB/s", rx, tx)); }
+                } else if let (Some(rx), Some(tx)) = (net.rx_bytes, net.tx_bytes) {
                     parts.push(format!("↓{} ↑{}", format_bytes(rx), format_bytes(tx)));
                 }
-                
                 info_lines.push(format!("{}Network:{} {}", cs.primary, cs.reset, parts.join(" ")));
             }
         }
     }
+
+    module!(info_lines, config.show_public_ip, "Public IP", info.public_ip, cs);
     
     if config.show_display {
-        if let Some(ref display) = info.display {
-            info_lines.push(format!("{}Display:{} {}", cs.primary, cs.reset, display));
+        if let Some(ref disp) = info.display {
+            let res = if config.show_resolution { if let Some(ref r) = info.resolution { format!(" @ {}", r) } else { String::new() } } else { String::new() };
+            info_lines.push(format!("{}Display:{} {}{}", cs.primary, cs.reset, disp, res));
         }
     }
+
+    module!(info_lines, config.show_locale, "Locale", info.locale, cs);
+    module!(info_lines, config.show_theme, "Theme", info.theme, cs);
+    module!(info_lines, config.show_icons, "Icons", info.icons, cs);
+    module!(info_lines, config.show_font, "Font", info.font, cs);
     
     if config.show_battery {
         if let Some((capacity, ref status)) = info.battery {
             let bar_color = if capacity > 50 { &cs.secondary } else if capacity > 20 { &cs.warning } else { &cs.error };
-            let bar = create_bar(capacity, bar_color, &cs.muted, config.use_color);
+            let bar = create_bar(capacity, bar_color, &cs.muted, config.use_color, bar_width);
             info_lines.push(format!("{}Battery:{} {}% ({}) {}",
                 cs.primary, cs.reset, capacity, status, bar));
         }
     }
     
-    // Color palette display
     if config.show_colors && config.use_color {
         info_lines.push(String::new());
         info_lines.push(format!("{}███{}███{}███{}███{}███{}███{}",
             cs.color1, cs.color2, cs.color3, cs.color4, cs.color5, cs.color6, cs.reset));
     }
     
-    // Render side-by-side
-    let max_lines = std::cmp::max(logo_lines.len(), info_lines.len());
-    let logo_width = logo_lines.iter().map(|s| s.len()).max().unwrap_or(0);
-    
     // Buffer stdout for performance
     use std::io::Write;
     let stdout = std::io::stdout();
     let mut handle = std::io::BufWriter::new(stdout.lock());
     
+    // Forced side-by-side render
+    let max_lines = std::cmp::max(logo_lines.len(), info_lines.len());
     for i in 0..max_lines {
         let (logo_content, logo_len) = if i < logo_lines.len() {
-            (logo_lines[i].as_str(), logo_lines[i].len())
+            (logo_lines[i].as_str(), visible_len(&logo_lines[i]))
         } else {
             ("", 0)
         };
@@ -889,18 +1051,18 @@ fn render_output(info: &Info, config: &Config) {
         let logo_part = format!("{}{}{}{}", cs.primary, logo_content, cs.reset, padding);
         
         let info_part = if i < info_lines.len() {
-            &info_lines[i]
+            truncate_ansi(&info_lines[i], available_info_width)
         } else {
-            ""
+            String::new()
         };
         
         writeln!(handle, "{}  {}", logo_part, info_part).unwrap_or(());
     }
 }
 
-fn create_bar(percent: u8, filled_color: &str, empty_color: &str, use_color: bool) -> String {
-    let filled = (percent as usize * PROGRESS_BAR_WIDTH) / 100;
-    let empty = PROGRESS_BAR_WIDTH - filled;
+fn create_bar(percent: u8, filled_color: &str, empty_color: &str, use_color: bool, width: usize) -> String {
+    let filled = (percent as usize * width) / 100;
+    let empty = width.saturating_sub(filled);
     
     if use_color {
         format!("[{}{}{}{}{}]",
@@ -944,7 +1106,7 @@ fn get_user() -> Option<String> {
 }
 
 fn get_hostname() -> Option<String> {
-    fs::read_to_string("/etc/hostname")
+    fs::read_to_string("/proc/sys/kernel/hostname")
         .ok()
         .map(|s| s.trim().to_string())
 }
@@ -1026,19 +1188,6 @@ fn format_unix_timestamp(timestamp: i64) -> String {
 }
 
 fn get_bootloader() -> Option<String> {
-    if let Some(output) = run_cmd("efibootmgr", &[]) {
-        let lower = output.to_lowercase();
-        if lower.contains("grub") {
-            return Some("GRUB".to_string());
-        } else if lower.contains("systemd") {
-            return Some("systemd-boot".to_string());
-        } else if lower.contains("refind") {
-            return Some("rEFInd".to_string());
-        } else if lower.contains("limine") {
-            return Some("Limine".to_string());
-        }
-    }
-    
     let systemd_paths = [
         "/boot/efi/loader/loader.conf",
         "/boot/loader/loader.conf",
@@ -1096,6 +1245,20 @@ fn get_bootloader() -> Option<String> {
     if Path::new("/boot/syslinux/syslinux.cfg").exists() {
         return Some("Syslinux".to_string());
     }
+
+    // Fallback to efibootmgr only if filesystem checks fail (slower)
+    if let Some(output) = run_cmd("efibootmgr", &[]) {
+        let lower = output.to_lowercase();
+        if lower.contains("grub") {
+            return Some("GRUB".to_string());
+        } else if lower.contains("systemd") {
+            return Some("systemd-boot".to_string());
+        } else if lower.contains("refind") {
+            return Some("rEFInd".to_string());
+        } else if lower.contains("limine") {
+            return Some("Limine".to_string());
+        }
+    }
     
     None
 }
@@ -1109,30 +1272,36 @@ fn get_packages() -> Option<String> {
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .count();
         if count > 0 {
-             // ALPM DB version is not a package, but usually 'local' contains only package dirs + 'ALPM_DB_VERSION'?
-             // Actually 'local' contains package directories. 'ALPM_DB_VERSION' might be a file?
-             // Checking file_type().is_dir() filters out files.
             counts.push(format!("{} (pacman)", count));
         }
     } else if let Some(count) = run_cmd("pacman", &["-Q"]).map(|s| s.lines().count()) {
-         // Fallback to command if path is unreadable
         counts.push(format!("{} (pacman)", count));
     }
-    if let Some(count) = run_cmd("dpkg", &["-l"]).map(|s| s.lines().filter(|l| l.starts_with("ii")).count()) {
-        counts.push(format!("{} (dpkg)", count));
-    }
-    if let Some(count) = run_cmd("rpm", &["-qa"]).map(|s| s.lines().count()) {
-        counts.push(format!("{} (rpm)", count));
-    }
-    if let Some(count) = run_cmd("flatpak", &["list"]).map(|s| s.lines().count()) {
-        if count > 0 {
-            counts.push(format!("{} (flatpak)", count));
+    
+    if Path::new("/var/lib/dpkg/status").exists() {
+        if let Some(count) = run_cmd("dpkg", &["-l"]).map(|s| s.lines().filter(|l| l.starts_with("ii")).count()) {
+            counts.push(format!("{} (dpkg)", count));
         }
     }
-    if let Some(count) = run_cmd("snap", &["list"]).map(|s| s.lines().count().saturating_sub(1)) {
-        if count > 0 {
-            counts.push(format!("{} (snap)", count));
+    
+    if Path::new("/var/lib/rpm").exists() {
+        if let Some(count) = run_cmd("rpm", &["-qa"]).map(|s| s.lines().count()) {
+            counts.push(format!("{} (rpm)", count));
         }
+    }
+
+    // Flatpak: fast dir check
+    if let Ok(entries) = fs::read_dir("/var/lib/flatpak/app") {
+        let count = entries.filter_map(Result::ok).count();
+        if count > 0 { counts.push(format!("{} (flatpak)", count)); }
+    }
+    
+    // Snap: count .snap files in /var/lib/snapd/snaps
+    if let Ok(entries) = fs::read_dir("/var/lib/snapd/snaps") {
+        let count = entries.filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".snap"))
+            .count();
+        if count > 0 { counts.push(format!("{} (snap)", count)); }
     }
     
     if counts.is_empty() {
@@ -1423,7 +1592,6 @@ fn get_swap() -> Option<(f64, f64)> {
     let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
     let mut total = 0.0;
     let mut free = 0.0;
-    
     for line in meminfo.lines() {
         if line.starts_with("SwapTotal:") {
             total = line.split_whitespace().nth(1)?.parse::<f64>().ok()? / KB_TO_GIB;
@@ -1431,12 +1599,148 @@ fn get_swap() -> Option<(f64, f64)> {
             free = line.split_whitespace().nth(1)?.parse::<f64>().ok()? / KB_TO_GIB;
         }
     }
-    
-    if total > 0.0 {
-        Some((total - free, total))
-    } else {
-        None
+    if total > 0.0 { Some((total - free, total)) } else { None }
+}
+
+fn get_cpu_cores() -> Option<(usize, usize)> {
+    let cpuinfo = fs::read_to_string("/proc/cpuinfo").ok()?;
+    let mut physical_cores = HashMap::new();
+    let mut logical_count = 0;
+    let mut current_id = 0;
+    for line in cpuinfo.lines() {
+        if line.starts_with("processor") { logical_count += 1; }
+        if line.starts_with("physical id") {
+            current_id = line.split(':').nth(1)?.trim().parse::<usize>().ok()?;
+        }
+        if line.starts_with("cpu cores") {
+            let cores = line.split(':').nth(1)?.trim().parse::<usize>().ok()?;
+            physical_cores.insert(current_id, cores);
+        }
     }
+    let total_physical: usize = physical_cores.values().sum();
+    if total_physical > 0 { Some((total_physical, logical_count)) } else { Some((logical_count, logical_count)) }
+}
+
+fn get_cpu_cache() -> Option<String> {
+    fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index3/size").ok().map(|s| s.trim().to_string())
+}
+
+fn get_gpu_vram() -> Option<Vec<String>> {
+    // Use lspci -v to find memory ranges for GPUs
+    if let Some(output) = run_cmd("lspci", &["-v"]) {
+        let mut vrams: Vec<String> = vec![];
+        let mut current_gpu_vram: Option<String> = None;
+        
+        for line in output.lines() {
+            if line.contains("VGA compatible controller") || line.contains("Display controller") || line.contains("3D controller") {
+                if let Some(vram) = current_gpu_vram { vrams.push(vram); }
+                current_gpu_vram = None;
+            }
+            if line.contains("Memory at") && line.contains("size=") {
+                if let Some(pos) = line.find("size=") {
+                    let size_part = &line[pos+5..];
+                    if let Some(end) = size_part.find(']') {
+                        let size_str = size_part[..end].to_string();
+                        let size_val = parse_human_size(&size_str).unwrap_or(0.0);
+                        let current_val = current_gpu_vram.as_ref().and_then(|v| parse_human_size(v)).unwrap_or(0.0);
+                        if size_val > current_val {
+                            current_gpu_vram = Some(size_str);
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(vram) = current_gpu_vram { vrams.push(vram); }
+        if !vrams.is_empty() { return Some(vrams); }
+    }
+    None
+}
+
+fn get_resolution() -> Option<String> {
+    if let Some(out) = run_cmd("wlr-randr", &[]) {
+        for line in out.lines() {
+            if line.contains(" px, ") && line.contains(" Hz") { return Some(line.trim().to_string()); }
+        }
+    }
+    if let Some(out) = run_cmd("xrandr", &["--current"]) {
+        for line in out.lines() {
+            if line.contains(" connected") && (line.contains(" primary") || !line.contains(" disconnected")) {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                for (i, &p) in parts.iter().enumerate() {
+                    if p.contains('x') && p.chars().next().unwrap_or(' ').is_digit(10) && i > 0 {
+                        return Some(p.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn get_entropy() -> Option<String> {
+    let avail = read_file_trim("/proc/sys/kernel/random/entropy_avail")?;
+    let pool = read_file_trim("/proc/sys/kernel/random/poolsize").unwrap_or_else(|| "4096".to_string());
+    Some(format!("{}/{}", avail, pool))
+}
+
+fn get_users_count() -> Option<usize> {
+    // 1. Try 'who' (standard POSIX)
+    if let Some(out) = run_cmd("who", &[]) {
+        let count = out.lines().filter(|l| !l.trim().is_empty()).count();
+        if count > 0 { return Some(count); }
+    }
+    
+    // 2. Try 'w -h' (very common on Linux)
+    if let Some(out) = run_cmd("w", &["-h"]) {
+        let count = out.lines().filter(|l| !l.trim().is_empty()).count();
+        if count > 0 { return Some(count); }
+    }
+
+    // 3. Try 'users' command
+    if let Some(out) = run_cmd("users", &[]) {
+        let count = out.split_whitespace().count();
+        if count > 0 { return Some(count); }
+    }
+
+    // 4. Try loginctl for systemd systems
+    if let Some(out) = run_cmd("loginctl", &["list-users", "--no-legend"]) {
+        let count = out.lines().filter(|l| !l.trim().is_empty()).count();
+        if count > 0 { return Some(count); }
+    }
+
+    // Fallback to current user if all else fails
+    Some(1)
+}
+
+fn get_failed_units() -> Option<usize> {
+    run_cmd("systemctl", &["list-units", "--failed", "--no-legend"]).map(|s| s.lines().count())
+}
+
+
+fn get_partitions_impl() -> Option<Vec<(String, String, f64, f64)>> {
+    if let Some(output) = run_cmd("df", &["-hT", "/"]) {
+        for line in output.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() >= 6 {
+                let source = fields[0];
+                let fstype = fields[1];
+                
+                if source == "Filesystem" || source == "none" || source == "tmpfs" {
+                    continue;
+                }
+                
+                if let (Some(total), Some(used)) = (
+                    parse_human_size(fields[2]),
+                    parse_human_size(fields[3])
+                ) {
+                    let dev_name = source.rsplit('/').next().unwrap_or(source);
+                    let display = format!("{} - {}", dev_name, fstype);
+                    return Some(vec![(display, "/".to_string(), used, total)]);
+                }
+            }
+        }
+    }
+    None
 }
 
 fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
@@ -1457,38 +1761,79 @@ fn read_file_trim(path: &str) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
-// ============================================================================
-// PARTITION INFORMATION
-// ============================================================================
+fn get_model() -> Option<String> {
+    let vendor = read_file_trim("/sys/class/dmi/id/sys_vendor").unwrap_or_default();
+    let product = read_file_trim("/sys/class/dmi/id/product_name").unwrap_or_default();
+    if vendor.is_empty() && product.is_empty() { return None; }
+    Some(format!("{} {}", vendor, product).trim().to_string())
+}
 
-fn get_partitions() -> Option<Vec<(String, String, f64, f64)>> {
-    if let Some(output) = run_cmd("df", &["-hT", "/"]) {
-        for line in output.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() >= 6 {
-                let source = fields[0];
-                let fstype = fields[1];
-                let _size = fields[2];
-                let _used = fields[3];
-                
-                if source == "Filesystem" || source == "none" || source == "tmpfs" {
-                    continue;
-                }
-                
-                if let (Some(total), Some(used)) = (
-                    parse_human_size(fields[2]),
-                    parse_human_size(fields[3])
-                ) {
-                    let dev_name = source.rsplit('/').next().unwrap_or(source);
-                    let display = format!("{} - {}", dev_name, fstype);
-                    return Some(vec![(display, "/".to_string(), used, total)]);
+fn get_motherboard() -> Option<String> {
+    read_file_trim("/sys/class/dmi/id/board_name")
+}
+
+fn get_bios() -> Option<String> {
+    read_file_trim("/sys/class/dmi/id/bios_version")
+}
+
+fn get_processes() -> Option<usize> {
+    fs::read_dir("/proc").ok()?.filter_map(|e| e.ok()).filter(|e| {
+        e.file_name().to_str().map(|s| s.chars().all(|c| c.is_digit(10))).unwrap_or(false)
+    }).count().into()
+}
+
+fn get_cpu_freq() -> Option<String> {
+    let mhz = read_file_trim("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")?.parse::<f64>().ok()? / 1000.0;
+    Some(format!("{:.2} GHz", mhz / 1000.0))
+}
+
+fn get_locale() -> Option<String> {
+    env::var("LANG").ok()
+}
+
+fn get_public_ip() -> Option<String> {
+    run_cmd("curl", &["-s", "--connect-timeout", "1", "https://icanhazip.com"])
+}
+
+struct ThemeInfo {
+    theme: Option<String>,
+    icons: Option<String>,
+    font: Option<String>,
+}
+
+fn get_theme_info() -> ThemeInfo {
+    let mut info = ThemeInfo { theme: None, icons: None, font: None };
+    
+    // Attempt gsettings (works for GNOME and many others)
+    if let Some(theme) = run_cmd("gsettings", &["get", "org.gnome.desktop.interface", "gtk-theme"]) {
+        info.theme = Some(theme.trim_matches('\'').to_string());
+    }
+    if let Some(icons) = run_cmd("gsettings", &["get", "org.gnome.desktop.interface", "icon-theme"]) {
+        info.icons = Some(icons.trim_matches('\'').to_string());
+    }
+    if let Some(font) = run_cmd("gsettings", &["get", "org.gnome.desktop.interface", "font-name"]) {
+        info.font = Some(font.trim_matches('\'').to_string());
+    }
+
+    // KDE Fallback
+    if info.theme.is_none() || info.font.is_none() {
+        if let Ok(home) = env::var("HOME") {
+            let kdeglobals = format!("{}/.config/kdeglobals", home);
+            if let Ok(content) = fs::read_to_string(kdeglobals) {
+                for line in content.lines() {
+                    if line.starts_with("widgetStyle=") && info.theme.is_none() {
+                        info.theme = Some(line.split('=').nth(1).unwrap_or("").to_string());
+                    } else if line.starts_with("font=") && info.font.is_none() {
+                        info.font = Some(line.split('=').nth(1).unwrap_or("").split(',').next().unwrap_or("").to_string());
+                    }
                 }
             }
         }
     }
     
-    None
+    info
 }
+
 
 fn parse_human_size(s: &str) -> Option<f64> {
     let s = s.trim();
@@ -1544,72 +1889,82 @@ fn get_battery() -> Option<(u8, String)> {
 // ENHANCED NETWORK INFORMATION
 // ============================================================================
 
-fn get_network() -> Option<Vec<NetworkInfo>> {
-    let mut networks = vec![];
+fn get_network_final(net_start: Option<String>, delta: f64) -> Option<Vec<NetworkInfo>> {
+    let dev1 = net_start?;
+    let dev2 = fs::read_to_string("/proc/net/dev").ok()?;
     
-    let net_dev = fs::read_to_string("/proc/net/dev").ok()?;
-    
-    for line in net_dev.lines().skip(2) {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 10 {
-            continue;
-        }
-        
-        let interface = parts[0].trim_end_matches(':').to_string();
-        
-        if interface == "lo" {
-            continue;
-        }
-        
-        let rx_bytes = parts[1].parse::<u64>().ok();
-        let tx_bytes = parts[9].parse::<u64>().ok();
-        
-        let state = read_file_trim(&format!("/sys/class/net/{}/operstate", interface))
-            .unwrap_or_else(|| "unknown".to_string())
-            .to_uppercase();
-        
-        let mac = read_file_trim(&format!("/sys/class/net/{}/address", interface));
-        
-        let ipv4 = if let Some(output) = run_cmd("ip", &["-4", "addr", "show", &interface]) {
-            output.lines()
-                .find(|l| l.trim().starts_with("inet "))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .map(|addr| addr.split('/').next().unwrap_or(addr).to_string())
-        } else {
-            None
-        };
-        
-        let ipv6 = if let Some(output) = run_cmd("ip", &["-6", "addr", "show", &interface]) {
-            output.lines()
-                .find(|l| l.trim().starts_with("inet6 ") && !l.contains("::1") && !l.contains("fe80"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .map(|addr| addr.split('/').next().unwrap_or(addr).to_string())
-        } else {
-            None
-        };
-        
-        if ipv4.is_some() || ipv6.is_some() || state == "UP" {
-            networks.push(NetworkInfo {
-                interface,
-                ipv4,
-                ipv6,
-                mac,
-                state,
-                rx_bytes,
-                tx_bytes,
-            });
+    let mut stats1 = HashMap::new();
+    for line in dev1.lines().skip(2) {
+        let p: Vec<&str> = line.split_whitespace().collect();
+        if p.len() > 9 { stats1.insert(p[0].trim_end_matches(':').to_string(), (p[1].parse::<u64>().unwrap_or(0), p[9].parse::<u64>().unwrap_or(0))); }
+    }
+
+    let mut ip_map = HashMap::new();
+    if let Some(output) = run_cmd("ip", &["-o", "addr", "show"]) {
+        for line in output.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 4 { continue; }
+            let iface = parts[1].to_string();
+            let family = parts[2];
+            let addr = parts[3].split('/').next().unwrap_or(parts[3]).to_string();
+            let entry = ip_map.entry(iface).or_insert((None, None));
+            if family == "inet" { entry.0 = Some(addr); }
+            else if family == "inet6" && !addr.starts_with("fe80") && addr != "::1" { entry.1 = Some(addr); }
         }
     }
-    
-    networks.sort_by(|a, b| {
-        match (a.state.as_str(), b.state.as_str()) {
-            ("UP", "UP") => a.interface.cmp(&b.interface),
-            ("UP", _) => std::cmp::Ordering::Less,
-            (_, "UP") => std::cmp::Ordering::Greater,
-            _ => a.interface.cmp(&b.interface),
+
+    let mut networks = vec![];
+    for line in dev2.lines().skip(2) {
+        let p: Vec<&str> = line.split_whitespace().collect();
+        if p.len() < 10 { continue; }
+        let interface = p[0].trim_end_matches(':').to_string();
+        if interface == "lo" { continue; }
+        let (ipv4, ipv6) = ip_map.remove(&interface).unwrap_or((None, None));
+        let state = read_file_trim(&format!("/sys/class/net/{}/operstate", interface)).unwrap_or_else(|| "unknown".to_string()).to_uppercase();
+        let rx2 = p[1].parse::<u64>().ok();
+        let tx2 = p[9].parse::<u64>().ok();
+        
+        let mut rx_rate = None;
+        let mut tx_rate = None;
+        if let (Some(r2), Some(t2), Some(&(r1, t1))) = (rx2, tx2, stats1.get(&interface)) {
+            rx_rate = Some((r2.saturating_sub(r1) as f64 / (1024.0 * 1024.0)) / delta);
+            tx_rate = Some((t2.saturating_sub(t1) as f64 / (1024.0 * 1024.0)) / delta);
         }
+
+        let mut p_stat = None;
+        let mut j_stat = None;
+        let mut l_stat = None;
+        if state == "UP" && ipv4.is_some() {
+            if let Some(out) = run_cmd("ping", &["-c", "2", "-i", "0.2", "-W", "1", "1.1.1.1"]) {
+                for l in out.lines() {
+                    if l.contains("packet loss") {
+                        if let Some(pos) = l.find('%') {
+                            let start = l[..pos].rfind(' ').unwrap_or(0);
+                            l_stat = l[start..pos].trim().parse::<f64>().ok();
+                        }
+                    } else if l.contains("rtt min/avg/max/mdev") {
+                        let stats: Vec<&str> = l.split('=').nth(1).unwrap_or("").trim().split('/').collect();
+                        if stats.len() >= 4 {
+                            p_stat = stats[1].parse::<f64>().ok();
+                            j_stat = stats[3].split(' ').next().and_then(|s| s.parse::<f64>().ok());
+                        }
+                    }
+                }
+            }
+        }
+
+        networks.push(NetworkInfo {
+            interface, ipv4, ipv6, mac: None, state, rx_bytes: rx2, tx_bytes: tx2,
+            rx_rate_mbs: rx_rate, tx_rate_mbs: tx_rate, ping: p_stat, jitter: j_stat, packet_loss: l_stat,
+        });
+    }
+
+    networks.sort_by(|a, b| {
+        let a_up = a.state == "UP";
+        let b_up = b.state == "UP";
+        if a_up != b_up { b_up.cmp(&a_up) } else { a.interface.cmp(&b.interface) }
     });
-    
+
     if networks.is_empty() { None } else { Some(networks) }
 }
 
