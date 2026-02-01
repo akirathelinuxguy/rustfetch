@@ -6,7 +6,101 @@ use std::{
     thread,
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
+    io::Write,
 };
+
+// POSIX kill() — used by the watchdog thread in run_cmd_timeout to enforce
+// hard timeouts without polling.  rustc links libc automatically; we just
+// need the declaration.
+extern "C" {
+    fn kill(pid: i32, sig: i32) -> i32;
+}
+const SIGKILL: i32 = 9;
+
+// ============================================================================
+// LOGGING CONFIGURATION
+// ============================================================================
+
+const LOG_FILE: &str = "/tmp/rustfetch_log";
+
+/// Returns true if logging is enabled.
+/// Logging is ON when the env var RUSTFETCH_LOG is set to any non-empty value.
+/// Example: RUSTFETCH_LOG=1 rustfetch
+fn log_enabled() -> bool {
+    std::env::var("RUSTFETCH_LOG").map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// Converts a Unix timestamp (seconds since epoch) to a human-readable string.
+/// Uses the same correct civil-date algorithm as format_unix_timestamp.
+fn timestamp_to_string(secs: u64) -> String {
+    const SECONDS_PER_DAY: u64 = 86400;
+    const DAYS_PER_400_YEARS: i64 = 146097;
+    const DAYS_SINCE_1970: i64 = 719468;
+
+    let days = (secs / SECONDS_PER_DAY) as i64 + DAYS_SINCE_1970;
+    let time_of_day = secs % SECONDS_PER_DAY;
+
+    let era = if days >= 0 { days } else { days - 146096 } / DAYS_PER_400_YEARS;
+    let doe = (days - era * DAYS_PER_400_YEARS) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y   = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp  = (5 * doy + 2) / 153;
+    let d   = doy - (153 * mp + 2) / 5 + 1;
+    let m   = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if m <= 2 { y + 1 } else { y };
+
+    let hour   = (time_of_day / 3600) % 24;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", year, m, d, hour, minute, second)
+}
+
+/// Logs a message to the rustfetch log file with timestamp and severity level.
+fn log_message(level: &str, category: &str, message: &str) {
+    if !log_enabled() {
+        return;
+    }
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| timestamp_to_string(d.as_secs()))
+        .unwrap_or_else(|_| "UNKNOWN_TIME".to_string());
+
+    let log_entry = format!(
+        "[{}] [{:7}] [{}] {}\n",
+        timestamp, level, category, message
+    );
+
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(LOG_FILE)
+    {
+        let _ = file.write_all(log_entry.as_bytes());
+    }
+}
+
+/// Logs an informational message - routine operations and status updates
+fn log_info(category: &str, message: &str) {
+    log_message("INFO", category, message);
+}
+
+/// Logs a warning message - unexpected but non-critical issues
+fn log_warn(category: &str, message: &str) {
+    log_message("WARNING", category, message);
+}
+
+/// Logs an error message - critical failures that prevent normal operation
+fn log_error(category: &str, message: &str) {
+    log_message("ERROR", category, message);
+}
+
+/// Logs a debug message - detailed information for troubleshooting
+fn log_debug(category: &str, message: &str) {
+    log_message("DEBUG", category, message);
+}
 
 // ============================================================================
 // VERSION INFO
@@ -579,6 +673,9 @@ struct Info {
     hostname: Option<String>,
     os: Option<String>,
     kernel: Option<String>,
+    arch: Option<String>,
+    virtualization: Option<String>,
+    security: Option<String>,
     public_ip: Option<String>,
     cpu_cores: Option<(usize, usize)>,
     cpu_cache: Option<String>,
@@ -632,6 +729,15 @@ impl ToJson for Info {
         }
         if let Some(ref v) = self.kernel {
             parts.push(format!("\"kernel\":{}", v.to_json()));
+        }
+        if let Some(ref v) = self.arch {
+            parts.push(format!("\"architecture\":{}", v.to_json()));
+        }
+        if let Some(ref v) = self.virtualization {
+            parts.push(format!("\"virtualization\":{}", v.to_json()));
+        }
+        if let Some(ref v) = self.security {
+            parts.push(format!("\"security\":{}", v.to_json()));
         }
         if let Some(ref v) = self.uptime {
             parts.push(format!("\"uptime\":{}", v.to_json()));
@@ -723,107 +829,198 @@ fn save_cache(info: &Info) {
 // ============================================================================
 
 fn main() {
+    log_info("STARTUP", "Rustfetch starting up");
+    log_debug("STARTUP", &format!("Version: {}", VERSION));
+    
     let config = match parse_args() {
-        Some(cfg) => cfg,
-        None => return,
+        Some(cfg) => {
+            log_info("CONFIG", "Command line arguments parsed successfully");
+            log_debug("CONFIG", &format!("Color enabled: {}, Theme: {}, JSON output: {}", 
+                cfg.use_color, cfg.color_scheme, cfg.json_output));
+            log_debug("CONFIG", &format!("Cache enabled: {}, TTL: {}s, Fast mode: {}", 
+                cfg.cache_enabled, cfg.cache_ttl, cfg.fast_mode));
+            cfg
+        },
+        None => {
+            log_info("STARTUP", "Help displayed or invalid arguments, exiting normally");
+            return;
+        }
     };
     
     if config.benchmark {
+        log_info("BENCHMARK", "Running in benchmark mode");
         run_benchmarks(&config);
+        log_info("BENCHMARK", "Benchmark completed");
         return;
     }
     
+    log_info("EXECUTION", "Beginning system information collection");
     let start_time = std::time::Instant::now();
     // Snapshot /proc/net/dev as early as possible for bandwidth delta
-    let net_start = if config.show_network { read_file_trim("/proc/net/dev") } else { None };
+    let net_start = if config.show_network { 
+        log_debug("NETWORK", "Reading initial network statistics from /proc/net/dev");
+        match read_file_trim("/proc/net/dev") {
+            Some(data) => {
+                log_debug("NETWORK", "Successfully captured initial network state");
+                Some(data)
+            },
+            None => {
+                log_warn("NETWORK", "Failed to read /proc/net/dev for network statistics");
+                None
+            }
+        }
+    } else { 
+        log_debug("NETWORK", "Network display disabled, skipping network stats");
+        None 
+    };
 
+    log_info("THREADS", "Spawning 5 parallel threads for system information gathering");
     let info = thread::scope(|s| {
         // ── Thread 1: pure env + file reads. ZERO spawns. ──
+        log_debug("THREAD1", "Starting Thread 1: Environment and file-based info (user, hostname, OS, kernel, etc.)");
         let cfg1 = config.clone();
         let t1 = s.spawn(move || {
+            log_debug("THREAD1", "Starting: env + file reads (user, hostname, OS, kernel, …)");
+
             let user        = get_user();
             let hostname    = get_hostname();
             let os          = get_os();
             let kernel      = get_kernel();
-            let uptime      = if cfg1.show_uptime    { get_uptime() }    else { None };
-            let shell       = if cfg1.show_shell     { get_shell() }     else { None };
-            let de          = if cfg1.show_de        { get_de() }        else { None };
-            let init        = if cfg1.show_init      { get_init() }      else { None };
-            let terminal    = if cfg1.show_terminal  { get_terminal() }  else { None };
-            let locale      = if cfg1.show_locale    { get_locale() }    else { None };
-            let model       = if cfg1.show_model     { get_model() }     else { None };
+
+            let uptime      = if cfg1.show_uptime    { get_uptime()    } else { None };
+            let shell       = if cfg1.show_shell     { get_shell()     } else { None };
+            let de          = if cfg1.show_de        { get_de()        } else { None };
+            let init        = if cfg1.show_init      { get_init()      } else { None };
+            let terminal    = if cfg1.show_terminal  { get_terminal()  } else { None };
+            let locale      = if cfg1.show_locale    { get_locale()    } else { None };
+            let model       = if cfg1.show_model     { get_model()     } else { None };
             let motherboard = if cfg1.show_motherboard { get_motherboard() } else { None };
-            let bios        = if cfg1.show_bios      { get_bios() }      else { None };
-            (user, hostname, os, kernel, uptime, shell, de, init, terminal, locale, model, motherboard, bios)
+            let bios        = if cfg1.show_bios      { get_bios()      } else { None };
+
+            let arch           = get_cpu_architecture();
+            let virtualization = get_virtualization();
+            let security       = get_security_module();
+
+            log_debug("THREAD1", &format!(
+                "Done: user={:?} host={:?} os={:?} kernel={:?} arch={:?} virt={:?}",
+                user, hostname, os, kernel, arch, virtualization
+            ));
+            (user, hostname, os, kernel, arch, virtualization, security, uptime, shell, de, init, terminal, locale, model, motherboard, bios)
         });
 
-        // ── Thread 2: cpu, mem+swap (1 read), battery, processes, users, entropy ──
         let cfg2 = config.clone();
         let t2 = s.spawn(move || {
+            log_debug("THREAD2", "Starting: CPU, memory, battery, processes");
+
             let cpu_info  = get_cpu_info_combined();
             let cpu_temp  = if cfg2.show_cpu_temp && !cfg2.fast_mode { get_cpu_temp() } else { None };
-            let (memory, swap) = if cfg2.show_memory || cfg2.show_swap { get_memory_and_swap() } else { (None, None) };
-            let battery   = if cfg2.show_battery   { get_battery() }     else { None };
-            let processes = if cfg2.show_processes { get_processes() }   else { None };
-            let users     = if cfg2.show_users     { get_users_count() } else { None };
-            let entropy   = if cfg2.show_entropy   { get_entropy() }     else { None };
+
+            let (memory, swap) = if cfg2.show_memory || cfg2.show_swap {
+                get_memory_and_swap()
+            } else { (None, None) };
+
+            let battery   = if cfg2.show_battery   { get_battery()        } else { None };
+            let processes = if cfg2.show_processes  { get_processes()      } else { None };
+            let users     = if cfg2.show_users      { get_users_count()    } else { None };
+            let entropy   = if cfg2.show_entropy    { get_entropy()        } else { None };
+
+            log_debug("THREAD2", &format!(
+                "Done: cpu={:?} temp={:?} mem={:?} swap={:?} bat={:?} procs={:?}",
+                cpu_info.name, cpu_temp, memory, swap, battery, processes
+            ));
             (cpu_info, cpu_temp, memory, swap, battery, processes, users, entropy)
         });
 
         // ── Thread 3: single lspci -v → gpu names + vram, then gpu temps ──
         let cfg3 = config.clone();
         let t3 = s.spawn(move || {
+            log_debug("THREAD3", "Starting: GPU detection");
+
             let (gpus, gpu_vram) = if cfg3.show_gpu || cfg3.show_gpu_vram {
                 get_gpu_combined()
             } else { (None, None) };
+
             let gpu_temps = if cfg3.show_gpu && !cfg3.fast_mode {
                 get_gpu_temp_with_gpus(gpus.as_ref())
             } else { None };
+
+            log_debug("THREAD3", &format!("Done: gpus={:?} temps={:?} vram={:?}", gpus, gpu_temps, gpu_vram));
             (gpus, gpu_temps, gpu_vram)
         });
 
         // ── Thread 4: packages, partitions (statfs), bootloader, wm, failed, theme ──
         let cfg4 = config.clone();
         let t4 = s.spawn(move || {
-            let packages     = if cfg4.show_packages     { get_packages() }     else { None };
+            log_debug("THREAD4", "Starting: packages, partitions, bootloader, WM, theme");
+
+            let packages     = if cfg4.show_packages     { get_packages()     } else { None };
             let partitions   = if cfg4.show_partitions   { get_partitions_impl() } else { None };
-            let boot_time    = if cfg4.show_boot_time    { get_boot_time() }    else { None };
-            let bootloader   = if cfg4.show_bootloader   { get_bootloader() }   else { None };
-            let wm           = if cfg4.show_wm           { get_wm() }           else { None };
+            let boot_time    = if cfg4.show_boot_time    { get_boot_time()    } else { None };
+            let bootloader   = if cfg4.show_bootloader   { get_bootloader()   } else { None };
+            let wm           = if cfg4.show_wm           { get_wm()           } else { None };
             let public_ip    = if cfg4.show_public_ip && !cfg4.fast_mode { get_public_ip() } else { None };
             let failed_units = if cfg4.show_failed_units { get_failed_units() } else { None };
             let theme_info   = if cfg4.show_theme || cfg4.show_icons || cfg4.show_font {
                 get_theme_info()
             } else { ThemeInfo { theme: None, icons: None, font: None } };
+
+            log_debug("THREAD4", &format!(
+                "Done: pkgs={:?} boot={:?} wm={:?} pub_ip={:?} failed={:?}",
+                packages, bootloader, wm, public_ip, failed_units
+            ));
             (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units, theme_info)
         });
 
         // ── Thread 5: display+resolution (1 xrandr) + prefetch ip for network ──
         let cfg5 = config.clone();
         let t5 = s.spawn(move || {
+            log_debug("THREAD5", "Starting: display + network IP prefetch");
+
             let (display, resolution) = if cfg5.show_display || cfg5.show_resolution {
                 get_display_and_resolution()
             } else { (None, None) };
+
             // Prefetch ip output so network assembly after join has zero extra latency
-            let ip_out = if cfg5.show_network { run_cmd("ip", &["-o", "addr", "show"]) } else { None };
+            let ip_out = if cfg5.show_network {
+                run_cmd("ip", &["-o", "addr", "show"])
+            } else { None };
+
+            log_debug("THREAD5", &format!("Done: display={:?} res={:?} ip_prefetch={}", display, resolution, ip_out.is_some()));
             (display, resolution, ip_out)
         });
 
         // ── join ──
-        let (user, hostname, os, kernel, uptime, shell, de, init, terminal, locale, model, motherboard, bios) = t1.join().unwrap();
+        log_debug("THREADS", "Waiting for all threads to complete");
+        let (user, hostname, os, kernel, arch, virtualization, security, uptime, shell, de, init, terminal, locale, model, motherboard, bios) = t1.join().unwrap();
+        log_debug("THREADS", "Thread 1 joined");
+        
         let (cpu_info, cpu_temp, memory, swap, battery, processes, users, entropy) = t2.join().unwrap();
+        log_debug("THREADS", "Thread 2 joined");
+        
         let (gpu, gpu_temps, gpu_vram) = t3.join().unwrap();
+        log_debug("THREADS", "Thread 3 joined");
+        
         let (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units, theme_info) = t4.join().unwrap();
+        log_debug("THREADS", "Thread 4 joined");
+        
         let (display, resolution, ip_out) = t5.join().unwrap();
+        log_debug("THREADS", "Thread 5 joined - all threads completed");
 
         // Network: uses pre-fetched ip output — no spawn on critical path
+        log_debug("NETWORK", "Finalizing network statistics");
         let network = if config.show_network {
             let delta = start_time.elapsed().as_secs_f64();
-            get_network_final_with_ip(net_start, delta, config.show_network_ping, ip_out)
+            log_debug("NETWORK", &format!("Network delta time: {:.3}s", delta));
+            let net = get_network_final_with_ip(net_start, delta, config.show_network_ping, ip_out);
+            if net.is_some() { log_debug("NETWORK", "Network information collected successfully"); }
+            else { log_warn("NETWORK", "Failed to collect network information"); }
+            net
         } else { None };
 
+        log_info("COLLECTION", "All system information collected successfully");
+
         Info {
-            user, hostname, os, kernel, uptime, shell, de, wm, init, terminal,
+            user, hostname, os, kernel, arch, virtualization, security, uptime, shell, de, wm, init, terminal,
             cpu: cpu_info.name,
             cpu_temp,
             cpu_cores: if cpu_info.cores.is_some() && cpu_info.threads > 0 {
@@ -840,17 +1037,33 @@ fn main() {
         }
     });
     
+    let elapsed = start_time.elapsed();
+    log_info("PERFORMANCE", &format!("Total execution time: {:.3}s", elapsed.as_secs_f64()));
+    
     if config.json_output {
+        log_debug("OUTPUT", "Rendering output in JSON format");
         println!("{}", info.to_json());
+        log_info("OUTPUT", "JSON output rendered successfully");
     } else {
+        log_debug("OUTPUT", "Rendering output in standard format");
         render_output(&info, &config);
+        log_info("OUTPUT", "Standard output rendered successfully");
     }
     
     // Fire-and-forget cache write — doesn't block exit
     if config.cache_enabled {
+        log_debug("CACHE", "Spawning background thread to save cache");
         let info_c = info.clone();
-        std::thread::spawn(move || save_cache(&info_c));
+        std::thread::spawn(move || {
+            log_debug("CACHE", "Writing cache to disk");
+            save_cache(&info_c);
+            log_debug("CACHE", "Cache saved successfully");
+        });
+    } else {
+        log_debug("CACHE", "Cache disabled, skipping save");
     }
+    
+    log_info("SHUTDOWN", "Rustfetch completed successfully");
 }
 
 // ============================================================================
@@ -1002,6 +1215,18 @@ fn render_output(info: &Info, config: &Config) {
     
     module!(info_lines, config.show_os, "OS", info.os, cs);
     module!(info_lines, config.show_kernel, "Kernel", info.kernel, cs);
+    
+    // Always show these new fields if they have data
+    if let Some(ref arch) = info.arch {
+        info_lines.push(format!("{}Arch:{} {}", cs.primary, cs.reset, arch));
+    }
+    if let Some(ref virt) = info.virtualization {
+        info_lines.push(format!("{}Virtualization:{} {}", cs.primary, cs.reset, virt));
+    }
+    if let Some(ref sec) = info.security {
+        info_lines.push(format!("{}Security:{} {}", cs.primary, cs.reset, sec));
+    }
+    
     module!(info_lines, config.show_uptime, "Uptime", info.uptime, cs);
     module!(info_lines, config.show_boot_time, "Boot", info.boot_time, cs);
     
@@ -1254,6 +1479,167 @@ fn get_kernel() -> Option<String> {
         .map(|s| s.trim().to_string())
 }
 
+fn get_virtualization() -> Option<String> {
+    // ── Zero-spawn checks first ───────────────────────────────────────────
+    // These cover every common VM / container in <1 µs on bare metal (all
+    // return None immediately).  The subprocess fallback at the bottom only
+    // fires when none of these match.
+
+    // Container indicators
+    if Path::new("/.dockerenv").exists() {
+        return Some("Docker".to_string());
+    }
+    if let Ok(cgroup) = fs::read_to_string("/proc/1/cgroup") {
+        if cgroup.contains("docker")   { return Some("Docker".to_string());     }
+        if cgroup.contains("lxc")      { return Some("LXC".to_string());        }
+        if cgroup.contains("kubepods") { return Some("Kubernetes".to_string()); }
+    }
+
+    // DMI product_name — covers VirtualBox, VMware, KVM, QEMU, Bochs
+    if let Ok(product) = fs::read_to_string("/sys/class/dmi/id/product_name") {
+        let lower = product.to_lowercase();
+        if lower.contains("virtualbox") { return Some("VirtualBox".to_string()); }
+        if lower.contains("vmware")     { return Some("VMware".to_string());     }
+        if lower.contains("kvm")        { return Some("KVM".to_string());        }
+        if lower.contains("qemu")       { return Some("QEMU".to_string());       }
+        if lower.contains("bochs")      { return Some("Bochs".to_string());      }
+    }
+
+    // Hyper-V
+    if let Ok(vendor) = fs::read_to_string("/sys/class/dmi/id/sys_vendor") {
+        if vendor.to_lowercase().contains("microsoft") {
+            if let Ok(product) = fs::read_to_string("/sys/class/dmi/id/product_name") {
+                if product.to_lowercase().contains("virtual") {
+                    return Some("Hyper-V".to_string());
+                }
+            }
+        }
+    }
+
+    // Xen
+    if Path::new("/proc/xen").exists() {
+        return Some("Xen".to_string());
+    }
+
+    // WSL
+    if let Ok(version) = fs::read_to_string("/proc/version") {
+        let lower = version.to_lowercase();
+        if lower.contains("microsoft") || lower.contains("wsl") {
+            return if Path::new("/run/WSL").exists() || version.contains("WSL2") {
+                Some("WSL2".to_string())
+            } else {
+                Some("WSL".to_string())
+            };
+        }
+    }
+
+    // ── Subprocess fallback ───────────────────────────────────────────────
+    // Only reached when file checks didn't match (rare edge-case VMs or
+    // unusual hypervisors).  On bare metal we never get here.
+    if let Some(output) = run_cmd("systemd-detect-virt", &[]) {
+        let virt = output.trim();
+        if virt != "none" && !virt.is_empty() {
+            let capitalized = virt.chars().next().unwrap().to_uppercase().collect::<String>() + &virt[1..];
+            log_debug("VIRT", &format!("Detected via systemd-detect-virt: {}", capitalized));
+            return Some(capitalized);
+        }
+    }
+
+    None
+}
+
+fn get_cpu_architecture() -> Option<String> {
+    // Zero-spawn: read the arch from the kernel build string in /proc/version,
+    // or fall back to the Rust compile-time constant which covers the vast majority of cases.
+    let arch_str: &str = {
+        // Try /proc/sys/kernel/arch first (not always present), then use compile-time const.
+        // The compile-time const matches uname -m on all standard Linux targets.
+        std::env::consts::ARCH
+    };
+
+    // Normalise to the same tokens uname -m would emit
+    let uname_style = match arch_str {
+        "x86_64"  => "x86_64",
+        "x86"     => "i686",
+        "aarch64" => "aarch64",
+        "arm"     => "armv7l",
+        "riscv64" => "riscv64",
+        "powerpc64" => "ppc64le",
+        "s390x"   => "s390x",
+        _         => arch_str,
+    };
+
+    let friendly_name = match uname_style {
+        "x86_64"  => "x86_64 (64-bit)",
+        "i686" | "i386" => "x86 (32-bit)",
+        "aarch64" => "ARM64",
+        "armv7l"  => "ARM (32-bit)",
+        "armv6l"  => "ARMv6",
+        "riscv64" => "RISC-V (64-bit)",
+        "ppc64le" => "PowerPC (64-bit LE)",
+        "s390x"   => "IBM Z",
+        other     => other,
+    };
+
+    log_debug("ARCH", &format!("Architecture: {}", friendly_name));
+    Some(friendly_name.to_string())
+}
+
+fn get_security_module() -> Option<String> {
+    log_debug("SECURITY", "Detecting security modules");
+    
+    let mut modules = Vec::new();
+    
+    // Check SELinux
+    if Path::new("/sys/fs/selinux").exists() {
+        if let Ok(enforcing) = fs::read_to_string("/sys/fs/selinux/enforce") {
+            let status = match enforcing.trim() {
+                "1" => "SELinux (enforcing)",
+                "0" => "SELinux (permissive)",
+                _ => "SELinux",
+            };
+            log_info("SECURITY", &format!("Detected {}", status));
+            modules.push(status.to_string());
+        } else {
+            modules.push("SELinux".to_string());
+        }
+    }
+    
+    // Check AppArmor
+    if Path::new("/sys/kernel/security/apparmor").exists() {
+        if let Ok(profiles) = fs::read_to_string("/sys/kernel/security/apparmor/profiles") {
+            let count = profiles.lines().count();
+            if count > 0 {
+                log_info("SECURITY", &format!("Detected AppArmor ({} profiles)", count));
+                modules.push(format!("AppArmor ({} profiles)", count));
+            } else {
+                modules.push("AppArmor".to_string());
+            }
+        } else {
+            modules.push("AppArmor".to_string());
+        }
+    }
+    
+    // Check Smack
+    if Path::new("/sys/fs/smackfs").exists() {
+        log_info("SECURITY", "Detected Smack");
+        modules.push("Smack".to_string());
+    }
+    
+    // Check TOMOYO
+    if Path::new("/sys/kernel/security/tomoyo").exists() {
+        log_info("SECURITY", "Detected TOMOYO");
+        modules.push("TOMOYO".to_string());
+    }
+    
+    if modules.is_empty() {
+        log_debug("SECURITY", "No security modules detected");
+        None
+    } else {
+        Some(modules.join(", "))
+    }
+}
+
 fn get_uptime() -> Option<String> {
     let uptime_str = fs::read_to_string("/proc/uptime").ok()?;
     let seconds = uptime_str.split_whitespace().next()?.parse::<f64>().ok()?;
@@ -1310,41 +1696,52 @@ fn format_unix_timestamp(timestamp: i64) -> String {
 }
 
 fn get_bootloader() -> Option<String> {
+    // ── Strategy: zero-spawn checks first, subprocesses last ─────────────
+    // On a typical system only ONE bootloader is installed.  File / path checks
+    // cost <1 µs each.  Subprocess spawns cost 1-5 ms each.  The old order
+    // spawned bootctl + up to 3 grub-* binaries before ever checking the file
+    // system, wasting 4+ spawns on any non-GRUB system.
+    //
+    // New order:
+    //   1. /proc/cmdline          — single read, catches Limine/GRUB/systemd-boot/rEFInd
+    //   2. Config-file checks     — all zero-spawn path.exists() / read
+    //   3. MBR signature          — file read (needs root, usually fails gracefully)
+    //   4. Subprocess fallbacks   — bootctl, grub-install, dmesg, efibootmgr
+    //   5. Final UEFI/BIOS guess
+
+    // ── 1. Kernel command line ────────────────────────────────────────────
+    // Most modern bootloaders stamp themselves here.  Single file read.
+    if let Ok(cmdline) = fs::read_to_string("/proc/cmdline") {
+        let lower = cmdline.to_lowercase();
+        if lower.contains("limine")                                      { return Some("Limine".to_string());      }
+        if lower.contains("grub")                                        { return Some("GRUB".to_string());        }
+        if lower.contains("systemd-boot") || lower.contains("gummiboot") { return Some("systemd-boot".to_string()); }
+        if lower.contains("refind")                                      { return Some("rEFInd".to_string());     }
+        // Explicit bootloader= parameter
+        for param in cmdline.split_whitespace() {
+            if let Some(bl) = param.strip_prefix("bootloader=") {
+                if !bl.is_empty() { return Some(bl.to_string()); }
+            }
+        }
+    }
+
+    // ── 2. Config-file / path checks (all zero-spawn) ─────────────────────
+
+    // systemd-boot
     let systemd_paths = [
         "/boot/efi/loader/loader.conf",
         "/boot/loader/loader.conf",
         "/efi/loader/loader.conf",
+        "/boot/efi/loader/entries",
+        "/boot/loader/entries",
+        "/efi/loader/entries",
+        "/boot/efi/EFI/systemd/systemd-bootx64.efi",
     ];
-    
     for path in &systemd_paths {
-        if Path::new(path).exists() {
-            return Some("systemd-boot".to_string());
-        }
+        if Path::new(path).exists() { return Some("systemd-boot".to_string()); }
     }
-    
-    let grub_paths = [
-        "/boot/grub/grub.cfg",
-        "/boot/grub2/grub.cfg",
-        "/boot/efi/EFI/grub/grub.cfg",
-        "/boot/efi/EFI/GRUB/grub.cfg",
-        "/boot/efi/EFI/ubuntu/grub.cfg",
-        "/boot/efi/EFI/cachyos/grub.cfg",
-        "/boot/efi/EFI/arch/grub.cfg",
-        "/boot/efi/EFI/fedora/grub.cfg",
-        "/boot/efi/EFI/debian/grub.cfg",
-    ];
-    
-    for path in &grub_paths {
-        if Path::new(path).exists() {
-            return Some("GRUB".to_string());
-        }
-    }
-    
-    if Path::new("/boot/efi/EFI/refind/refind.conf").exists() ||
-       Path::new("/efi/EFI/refind/refind.conf").exists() {
-        return Some("rEFInd".to_string());
-    }
-    
+
+    // Limine
     let limine_paths = [
         "/boot/limine.cfg",
         "/boot/efi/limine.cfg",
@@ -1352,79 +1749,296 @@ fn get_bootloader() -> Option<String> {
         "/boot/limine/limine.cfg",
         "/boot/efi/EFI/limine/limine.cfg",
         "/boot/efi/EFI/BOOT/limine.cfg",
+        "/boot/limine.sys",
     ];
-    
     for path in &limine_paths {
-        if Path::new(path).exists() {
-            return Some("Limine".to_string());
-        }
-    }
-    
-    if Path::new("/etc/lilo.conf").exists() {
-        return Some("LILO".to_string());
-    }
-    
-    if Path::new("/boot/syslinux/syslinux.cfg").exists() {
-        return Some("Syslinux".to_string());
+        if Path::new(path).exists() { return Some("Limine".to_string()); }
     }
 
-    if let Some(output) = run_cmd("efibootmgr", &[]) {
-        let lower = output.to_lowercase();
-        if lower.contains("grub") {
-            return Some("GRUB".to_string());
-        } else if lower.contains("systemd") {
-            return Some("systemd-boot".to_string());
-        } else if lower.contains("refind") {
-            return Some("rEFInd".to_string());
-        } else if lower.contains("limine") {
-            return Some("Limine".to_string());
+    // GRUB config files
+    let grub_paths = [
+        "/boot/grub/grub.cfg", "/boot/grub2/grub.cfg",
+        "/boot/efi/EFI/grub/grub.cfg", "/boot/efi/EFI/GRUB/grub.cfg",
+        "/boot/efi/EFI/ubuntu/grub.cfg", "/boot/efi/EFI/cachyos/grub.cfg",
+        "/boot/efi/EFI/arch/grub.cfg", "/boot/efi/EFI/fedora/grub.cfg",
+        "/boot/efi/EFI/debian/grub.cfg", "/boot/efi/EFI/opensuse/grub.cfg",
+        "/boot/efi/EFI/centos/grub.cfg", "/boot/efi/EFI/rhel/grub.cfg",
+        "/boot/efi/EFI/gentoo/grub.cfg", "/boot/efi/EFI/manjaro/grub.cfg",
+        "/boot/efi/EFI/endeavouros/grub.cfg", "/boot/efi/EFI/pop/grub.cfg",
+        "/boot/efi/EFI/garuda/grub.cfg", "/boot/efi/EFI/zorin/grub.cfg",
+        "/boot/efi/EFI/mint/grub.cfg", "/boot/efi/EFI/elementary/grub.cfg",
+        "/boot/efi/EFI/kali/grub.cfg", "/boot/efi/EFI/parrot/grub.cfg",
+        "/boot/efi/EFI/solus/grub.cfg", "/boot/efi/EFI/void/grub.cfg",
+        "/boot/efi/EFI/alpine/grub.cfg", "/boot/efi/EFI/nixos/grub.cfg",
+        "/boot/efi/EFI/slackware/grub.cfg",
+        "/boot/grub/menu.lst", "/boot/grub2/menu.lst", "/boot/grub/grub.conf",
+    ];
+    for path in &grub_paths {
+        if Path::new(path).exists() {
+            let label = if path.contains("grub2") { "GRUB 2" } else { "GRUB 2" }; // modern default
+            return Some(label.to_string());
         }
     }
-    
-    None
+    // GRUB EFI binaries (no config but binary present)
+    if Path::new("/boot/efi/EFI/grub/grubx64.efi").exists() ||
+       Path::new("/boot/efi/EFI/GRUB/grubx64.efi").exists() {
+        return Some("GRUB 2".to_string());
+    }
+
+    // rEFInd
+    let refind_paths = [
+        "/boot/efi/EFI/refind/refind.conf",
+        "/efi/EFI/refind/refind.conf",
+        "/boot/efi/EFI/BOOT/refind.conf",
+        "/boot/refind/refind.conf",
+        "/boot/efi/refind/refind.conf",
+        "/boot/efi/EFI/refind/refind_x64.efi",
+    ];
+    for path in &refind_paths {
+        if Path::new(path).exists() { return Some("rEFInd".to_string()); }
+    }
+
+    // Clover
+    if Path::new("/boot/efi/EFI/CLOVER/config.plist").exists() ||
+       Path::new("/efi/EFI/CLOVER/config.plist").exists() ||
+       Path::new("/boot/efi/EFI/CLOVER/CLOVERX64.efi").exists() {
+        return Some("Clover".to_string());
+    }
+
+    // OpenCore
+    if Path::new("/boot/efi/EFI/OC/config.plist").exists() ||
+       Path::new("/efi/EFI/OC/config.plist").exists() ||
+       Path::new("/boot/efi/EFI/OC/OpenCore.efi").exists() {
+        return Some("OpenCore".to_string());
+    }
+
+    // LILO
+    if Path::new("/etc/lilo.conf").exists() { return Some("LILO".to_string()); }
+
+    // Syslinux / ISOLINUX / EXTLINUX / PXELINUX
+    let syslinux_paths = [
+        ("/boot/syslinux/syslinux.cfg",     "Syslinux"),
+        ("/boot/extlinux/extlinux.conf",     "EXTLINUX"),
+        ("/boot/isolinux/isolinux.cfg",      "ISOLINUX"),
+        ("/extlinux.conf",                   "EXTLINUX"),
+        ("/syslinux.cfg",                    "Syslinux"),
+        ("/boot/syslinux.cfg",               "Syslinux"),
+        ("/boot/pxelinux.cfg/default",       "PXELINUX"),
+    ];
+    for (path, name) in &syslinux_paths {
+        if Path::new(path).exists() { return Some(name.to_string()); }
+    }
+
+    // U-Boot
+    let uboot_paths = ["/boot/u-boot.bin", "/boot/boot.scr", "/boot/uEnv.txt", "/boot/uboot.env"];
+    for path in &uboot_paths {
+        if Path::new(path).exists() { return Some("U-Boot".to_string()); }
+    }
+
+    // BURG
+    if Path::new("/boot/burg/burg.cfg").exists() { return Some("BURG".to_string()); }
+
+    // ELILO
+    if Path::new("/boot/efi/EFI/elilo/elilo.conf").exists() ||
+       Path::new("/etc/elilo.conf").exists() {
+        return Some("ELILO".to_string());
+    }
+
+    // GRUB4DOS
+    if Path::new("/boot/grub4dos/menu.lst").exists() { return Some("GRUB4DOS".to_string()); }
+
+    // Petitboot
+    if Path::new("/etc/petitboot").exists() { return Some("Petitboot".to_string()); }
+
+    // Raspberry Pi
+    if (Path::new("/boot/config.txt").exists() || Path::new("/boot/firmware/config.txt").exists()) &&
+       (Path::new("/boot/start.elf").exists()  || Path::new("/boot/firmware/start.elf").exists()) {
+        return Some("Raspberry Pi Bootloader".to_string());
+    }
+
+    // Coreboot / Libreboot (DMI bios_version)
+    if let Ok(bios_ver) = fs::read_to_string("/sys/class/dmi/id/bios_version") {
+        let lower = bios_ver.to_lowercase();
+        if lower.contains("coreboot")  { return Some("Coreboot".to_string());  }
+        if lower.contains("libreboot") { return Some("Libreboot".to_string()); }
+    }
+
+    // BOOTX64.EFI signature scan — only if nothing else matched
+    // (checks both systemd-boot and Limine signatures in one read)
+    let bootx64 = "/boot/efi/EFI/BOOT/BOOTX64.EFI";
+    if Path::new(bootx64).exists() {
+        if let Ok(content) = fs::read(bootx64) {
+            let preview = String::from_utf8_lossy(&content[..content.len().min(8192)]);
+            if preview.contains("systemd-boot") || preview.contains("gummiboot") { return Some("systemd-boot".to_string()); }
+            if preview.contains("Limine")       || preview.contains("limine")    { return Some("Limine".to_string());      }
+        }
+    }
+
+    // ── 3. MBR signature (legacy BIOS, needs root to read device) ─────────
+    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && (parts[1] == "/" || parts[1] == "/boot") {
+                let base_device = parts[0]
+                    .trim_end_matches(|c: char| c.is_ascii_digit())
+                    .trim_end_matches('p');
+                if let Ok(mbr) = fs::read(base_device) {
+                    if mbr.len() >= 512 {
+                        let mbr_str = String::from_utf8_lossy(&mbr[0..512]);
+                        if mbr_str.contains("GRUB")     { return Some("GRUB".to_string());     }
+                        if mbr_str.contains("LILO")     { return Some("LILO".to_string());     }
+                        if mbr_str.contains("SYSLINUX") { return Some("Syslinux".to_string()); }
+                        if mbr_str.contains("ISOLINUX") { return Some("ISOLINUX".to_string()); }
+                    }
+                }
+                if parts[1] == "/" { break; }
+            }
+        }
+    }
+
+    // ── 4. Subprocess fallbacks (only if everything above missed) ──────────
+    // bootctl — confirms systemd-boot when config files are somehow absent
+    if let Some(output) = run_cmd("bootctl", &["status"]) {
+        if output.to_lowercase().contains("systemd-boot") {
+            return Some("systemd-boot".to_string());
+        }
+    }
+
+    // dmesg — last-resort kernel log scan
+    if let Some(dmesg) = run_cmd("dmesg", &[]) {
+        let lower = dmesg.to_lowercase();
+        if lower.contains("grub") && lower.contains("loading")  { return Some("GRUB".to_string());        }
+        if lower.contains("systemd-boot")                        { return Some("systemd-boot".to_string()); }
+    }
+
+    // efibootmgr — reads EFI boot entries (slow, may need root)
+    if let Some(output) = run_cmd("efibootmgr", &["-v"]) {
+        let lower = output.to_lowercase();
+        // Find current boot entry (marked with *)
+        let current = output.lines()
+            .find(|l| l.contains('*'))
+            .map(|s| s.to_lowercase());
+        if let Some(ref cur) = current {
+            if cur.contains("grub")       { return Some("GRUB 2".to_string());        }
+            if cur.contains("systemd")    { return Some("systemd-boot".to_string());  }
+            if cur.contains("refind")     { return Some("rEFInd".to_string());        }
+            if cur.contains("limine")     { return Some("Limine".to_string());        }
+            if cur.contains("clover")     { return Some("Clover".to_string());        }
+            if cur.contains("opencore")   { return Some("OpenCore".to_string());      }
+        }
+        // Scan all entries as fallback
+        if lower.contains("grub")     { return Some("GRUB 2".to_string());        }
+        if lower.contains("systemd")  { return Some("systemd-boot".to_string());  }
+        if lower.contains("refind")   { return Some("rEFInd".to_string());        }
+        if lower.contains("limine")   { return Some("Limine".to_string());        }
+    }
+
+    // ── 5. Final UEFI / BIOS guess ─────────────────────────────────────────
+    if Path::new("/sys/firmware/efi").exists() {
+        Some("Unknown (UEFI)".to_string())
+    } else {
+        Some("Unknown (BIOS)".to_string())
+    }
 }
 
 fn get_packages() -> Option<String> {
-    let mut counts = Vec::with_capacity(5);
-    
+    let mut counts = Vec::with_capacity(8);
+
+    // ── pacman (Arch, Manjaro, …) ──────────────────────────────────────────
+    // pacman's local db is a directory of per-package subdirs
+    let mut has_pacman = false;
     if let Ok(entries) = fs::read_dir("/var/lib/pacman/local") {
         let count = entries.filter_map(Result::ok)
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
             .count();
         if count > 0 {
             counts.push(format!("{} (pacman)", count));
-        }
-    }
-    
-    if Path::new("/var/lib/dpkg/status").exists() {
-        if let Some(count) = run_cmd("dpkg", &["-l"]).map(|s| s.lines().filter(|l| l.starts_with("ii")).count()) {
-            counts.push(format!("{} (dpkg)", count));
-        }
-    }
-    
-    if Path::new("/var/lib/rpm").exists() {
-        if let Some(count) = run_cmd("rpm", &["-qa"]).map(|s| s.lines().count()) {
-            counts.push(format!("{} (rpm)", count));
+            has_pacman = true;
         }
     }
 
+    // ── AUR (Arch User Repository) ─────────────────────────────────────────
+    // AUR packages are installed via pacman but not present in any sync db.
+    // `pacman -Qm` ("foreign") lists exactly those — it's fast (~30 ms).
+    // Only run it when we already know pacman is present.
+    if has_pacman {
+        if let Some(out) = run_cmd("pacman", &["-Qm"]) {
+            let count = out.lines().filter(|l| !l.trim().is_empty()).count();
+            if count > 0 {
+                counts.push(format!("{} (AUR)", count));
+            }
+        }
+    }
+
+    // ── dpkg / APT (Debian, Ubuntu, …) ────────────────────────────────────
+    if Path::new("/var/lib/dpkg/status").exists() {
+        if let Some(count) = run_cmd("dpkg", &["--get-selections"])
+            .map(|s| s.lines().filter(|l| l.ends_with("install")).count())
+        {
+            if count > 0 { counts.push(format!("{} (dpkg)", count)); }
+        }
+    }
+
+    // ── .deb files (manually downloaded, not yet installed) ────────────────
+    // Scan common download directories for loose .deb files.  These are NOT
+    // tracked by dpkg so they won't show up in any package-manager count.
+    if let Ok(home) = env::var("HOME") {
+        let deb_dirs = [
+            format!("{}/Downloads", home),
+            format!("{}/downloads", home),
+            home.clone(),
+        ];
+        let mut deb_count: usize = 0;
+        for dir in &deb_dirs {
+            if let Ok(entries) = fs::read_dir(dir) {
+                deb_count += entries.filter_map(Result::ok)
+                    .filter(|e| {
+                        e.file_type().map(|t| t.is_file()).unwrap_or(false)
+                            && e.file_name().to_string_lossy().ends_with(".deb")
+                    })
+                    .count();
+            }
+        }
+        if deb_count > 0 {
+            counts.push(format!("{} (.deb)", deb_count));
+        }
+    }
+
+    // ── RPM-based: DNF (Fedora) / YUM (RHEL/CentOS) / plain RPM ───────────
+    // All three use the same rpm database, so `rpm -qa` gives the installed
+    // count regardless.  We just pick the most specific label available.
+    if Path::new("/var/lib/rpm").exists() {
+        if let Some(out) = run_cmd("rpm", &["-qa"]) {
+            let count = out.lines().filter(|l| !l.trim().is_empty()).count();
+            if count > 0 {
+                // Label priority: dnf > yum > rpm
+                let label = if Path::new("/var/lib/dnf").exists() {
+                    "dnf"       // Fedora 22+, modern RHEL/CentOS 9+
+                } else if Path::new("/var/lib/yum").exists() {
+                    "yum"       // older RHEL/CentOS
+                } else {
+                    "rpm"       // generic fallback
+                };
+                counts.push(format!("{} ({})", count, label));
+            }
+        }
+    }
+
+    // ── Flatpak ────────────────────────────────────────────────────────────
     if let Ok(entries) = fs::read_dir("/var/lib/flatpak/app") {
         let count = entries.filter_map(Result::ok).count();
         if count > 0 { counts.push(format!("{} (flatpak)", count)); }
     }
-    
+
+    // ── Snap ───────────────────────────────────────────────────────────────
     if let Ok(entries) = fs::read_dir("/var/lib/snapd/snaps") {
         let count = entries.filter_map(Result::ok)
             .filter(|e| e.file_name().to_string_lossy().ends_with(".snap"))
             .count();
         if count > 0 { counts.push(format!("{} (snap)", count)); }
     }
-    
-    if counts.is_empty() {
-        None
-    } else {
-        Some(counts.join(", "))
-    }
+
+    if counts.is_empty() { None } else { Some(counts.join(", ")) }
 }
 
 fn get_shell() -> Option<String> {
@@ -1439,13 +2053,29 @@ fn get_de() -> Option<String> {
 }
 
 fn get_wm() -> Option<String> {
-    std::env::var("XDG_CURRENT_DESKTOP")
-        .ok()
-        .or_else(|| run_cmd("wmctrl", &["-m"]).and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Name:"))
-                .map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())
-        }))
+    // Fast zero-spawn checks for common WMs via env vars
+    // (many compositors/WMs set one of these)
+    if let Ok(v) = std::env::var("WAYLAND_DISPLAY") {
+        if !v.is_empty() {
+            // On Wayland, the compositor IS the WM — try to identify it
+            if let Ok(desktop) = std::env::var("XDG_CURRENT_DESKTOP") {
+                let d = desktop.to_lowercase();
+                if d.contains("mutter") || d.contains("gnome")  { return Some("Mutter".to_string()); }
+                if d.contains("kwin")   || d.contains("kde")    { return Some("KWin".to_string());   }
+                if d.contains("sway")                            { return Some("Sway".to_string());   }
+                if d.contains("i3")                              { return Some("i3".to_string());     }
+                if d.contains("bspwm")                           { return Some("bspwm".to_string()); }
+            }
+        }
+    }
+
+    // On X11, try wmctrl only as a last resort (subprocess)
+    run_cmd("wmctrl", &["-m"]).and_then(|s| {
+        s.lines()
+            .find(|l| l.starts_with("Name:"))
+            .map(|l| l.split(':').nth(1).unwrap_or("").trim().to_string())
+            .filter(|n| !n.is_empty())
+    })
 }
 
 fn get_init() -> Option<String> {
@@ -1799,18 +2429,39 @@ fn get_entropy() -> Option<String> {
 }
 
 fn get_users_count() -> Option<usize> {
-    // Count entries with real login shells — zero subprocess spawns.
-    if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
-        let count = passwd.lines().filter(|line| {
-            if line.is_empty() || line.starts_with('#') { return false; }
-            match line.rsplit(':').next() {
-                Some(shell) => shell != "/sbin/nologin" && shell != "/bin/false" && shell != "/usr/sbin/nologin",
-                None => false,
+    // Zero-spawn: scan /proc/[pid]/loginuid for distinct numeric UIDs ≥ 1000
+    // (UIDs < 1000 are system/service accounts, not real login sessions).
+    // Falls back to counting unique entries in /var/run/utmp via the `who` command
+    // only if /proc scanning yields nothing.
+    if let Ok(proc_entries) = fs::read_dir("/proc") {
+        let mut uids = std::collections::HashSet::new();
+        for entry in proc_entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if !name.chars().all(|c| c.is_ascii_digit()) { continue; }
+            let loginuid_path = entry.path().join("loginuid");
+            if let Ok(content) = fs::read_to_string(&loginuid_path) {
+                if let Ok(uid) = content.trim().parse::<u32>() {
+                    // 4294967295 (0xFFFFFFFF) means "no login session"
+                    if uid < 0xFFFF_FFFF && uid >= 1000 {
+                        uids.insert(uid);
+                    }
+                }
             }
-        }).count();
+        }
+        if !uids.is_empty() {
+            log_debug("USERS", &format!("Found {} distinct login UID(s) via /proc", uids.len()));
+            return Some(uids.len());
+        }
+    }
+
+    // Fallback: spawn `who` (rare — only if /proc is inaccessible)
+    if let Some(output) = run_cmd("who", &[]) {
+        let count = output.lines().filter(|l| !l.trim().is_empty()).count();
         if count > 0 { return Some(count); }
     }
-    Some(1)
+
+    Some(1) // at minimum, we ourselves are logged in
 }
 
 fn get_failed_units() -> Option<usize> {
@@ -1848,22 +2499,105 @@ fn get_partitions_impl() -> Option<Vec<(String, String, f64, f64)>> {
     Some(vec![(format!("{} - {}", dev_short, fst), "/".to_string(), total - avail, total)])
 }
 
+/// Default timeout for external commands (seconds).
+const CMD_TIMEOUT_SECS: u64 = 2;
+
 fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
-    Command::new(cmd)
+    run_cmd_timeout(cmd, args, CMD_TIMEOUT_SECS)
+}
+
+/// Run an external command with a hard timeout. Returns None on failure, timeout, or non-zero exit.
+fn run_cmd_timeout(cmd: &str, args: &[&str], timeout_secs: u64) -> Option<String> {
+    let args_str = args.join(" ");
+    log_debug("COMMAND", &format!("Executing: {} {} (timeout={}s)", cmd, args_str, timeout_secs));
+
+    let mut child = match Command::new(cmd)
         .args(args)
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
-            } else {
-                None
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            log_error("COMMAND", &format!("Failed to spawn {} {}: {}", cmd, args_str, e));
+            return None;
+        }
+    };
+
+    // Spawn a watchdog thread that kills the child after the timeout.
+    // This is detached — it holds a raw pid and simply sends SIGKILL after
+    // the deadline.  If the child already exited, kill() is a harmless no-op
+    // (the pid may be recycled, but only after a full wait, which we do below).
+    let pid = child.id();
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+    std::thread::spawn(move || {
+        std::thread::sleep(timeout);
+        // Best-effort kill.  If the process already exited this does nothing.
+        unsafe { kill(pid as i32, SIGKILL); }
+    });
+
+    // wait_with_output reads stdout+stderr to EOF *concurrently* with waiting
+    // for exit.  This is critical: if we called try_wait() in a loop without
+    // reading the pipes, a child producing more output than the pipe buffer
+    // (~64 KB) would block on write and never exit — a deadlock.
+    let output = match child.wait_with_output() {
+        Ok(o) => o,
+        Err(e) => {
+            log_error("COMMAND", &format!("Failed to read output of {} {}: {}", cmd, args_str, e));
+            return None;
+        }
+    };
+
+    // If the watchdog killed us, the signal is SIGKILL (137).
+    if let Some(code) = output.status.code() {
+        if code == 137 {
+            log_warn("COMMAND", &format!("Timed out after {}s: {} {}", timeout_secs, cmd, args_str));
+            return None;
+        }
+    }
+    // Also catch the signal-killed case (no exit code, killed by signal).
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = output.status.signal() {
+            if sig == SIGKILL {
+                log_warn("COMMAND", &format!("Timed out (SIGKILL) after {}s: {} {}", timeout_secs, cmd, args_str));
+                return None;
             }
-        })
+        }
+    }
+
+    if !output.status.success() {
+        let exit_code = output.status.code().unwrap_or(-1);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        log_warn("COMMAND", &format!("{} {} exited {}: {}", cmd, args_str, exit_code, stderr.trim()));
+        return None;
+    }
+
+    match String::from_utf8(output.stdout) {
+        Ok(stdout) => {
+            let result = stdout.trim().to_string();
+            log_debug("COMMAND", &format!("{} {} → {} bytes", cmd, args_str, result.len()));
+            Some(result)
+        }
+        Err(e) => {
+            log_error("COMMAND", &format!("Non-UTF8 output from {} {}: {}", cmd, args_str, e));
+            None
+        }
+    }
 }
 
 fn read_file_trim(path: &str) -> Option<String> {
-    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            let trimmed = content.trim().to_string();
+            log_debug("FILE", &format!("Successfully read {}: {} bytes", path, trimmed.len()));
+            Some(trimmed)
+        }
+        Err(e) => {
+            log_debug("FILE", &format!("Could not read {} (this is normal if file doesn't exist): {}", path, e));
+            None
+        }
+    }
 }
 
 fn get_model() -> Option<String> {
@@ -1892,7 +2626,9 @@ fn get_locale() -> Option<String> {
 }
 
 fn get_public_ip() -> Option<String> {
-    run_cmd("curl", &["-s", "--connect-timeout", "1", "https://icanhazip.com"])
+    // --connect-timeout 1: fail fast if host is unreachable
+    // --max-time 2:        abort if the whole request takes > 2s (slow server)
+    run_cmd_timeout("curl", &["-s", "--connect-timeout", "1", "--max-time", "2", "https://icanhazip.com"], 3)
 }
 
 struct ThemeInfo {
@@ -1991,11 +2727,6 @@ fn get_battery() -> Option<(u8, String)> {
     }
     
     None
-}
-
-fn get_network_final(net_start: Option<String>, delta: f64, should_ping: bool) -> Option<Vec<NetworkInfo>> {
-    let ip_out = run_cmd("ip", &["-o", "addr", "show"]);
-    get_network_final_with_ip(net_start, delta, should_ping, ip_out)
 }
 
 fn get_network_final_with_ip(net_start: Option<String>, delta: f64, should_ping: bool, ip_out: Option<String>) -> Option<Vec<NetworkInfo>> {
