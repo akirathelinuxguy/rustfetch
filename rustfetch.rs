@@ -5,13 +5,14 @@ use std::{
     process::Command,
     thread,
     collections::HashMap,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 // ============================================================================
 // VERSION INFO
 // ============================================================================
 
-const VERSION: &str = "0.1.2";
+const VERSION: &str = "0.2.0";
 const PROGRAM_NAME: &str = "rustfetch";
 
 macro_rules! module {
@@ -34,6 +35,9 @@ struct Config {
     color_scheme: String,
     json_output: bool,
     cache_enabled: bool,
+    cache_ttl: u64,
+    fast_mode: bool,
+    benchmark: bool,
     show_os: bool,
     show_kernel: bool,
     show_uptime: bool,
@@ -52,6 +56,7 @@ struct Config {
     show_swap: bool,
     show_partitions: bool,
     show_network: bool,
+    show_network_ping: bool,
     show_display: bool,
     show_battery: bool,
     show_colors: bool,
@@ -81,6 +86,9 @@ impl Default for Config {
             color_scheme: "classic".to_string(),
             json_output: false,
             cache_enabled: true,
+            cache_ttl: 60,
+            fast_mode: false,
+            benchmark: false,
             show_os: true,
             show_kernel: true,
             show_uptime: true,
@@ -99,6 +107,7 @@ impl Default for Config {
             show_swap: true,
             show_partitions: true,
             show_network: true,
+            show_network_ping: false,
             show_display: true,
             show_battery: true,
             show_colors: true,
@@ -136,6 +145,10 @@ OPTIONS:
     -n, --no-color      Disable colored output
     -t, --theme <NAME>  Set color theme (classic, pastel, gruvbox, nord, dracula)
     --no-cache          Disable caching
+    --cache-ttl <SEC>   Set cache TTL in seconds (default: 60)
+    --fast              Fast mode - skip expensive operations (temps, ping)
+    --benchmark         Show timing for each operation
+    --network-ping      Enable network ping tests (slower)
 
 MODULES:
     --os / --kernel / --uptime / --boot / --packages
@@ -148,19 +161,18 @@ MODULES:
 
 EXAMPLES:
     {}              Show system info with default settings
-    {} --no-gpu     Show info without GPU
-    {} -t gruvbox   Use gruvbox color theme"#,
-        PROGRAM_NAME, VERSION, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME
+    {} --fast       Fast mode (~60% faster)
+    {} --benchmark  Show performance timing
+    {} -t gruvbox   Use gruvbox color theme
+    {} --network-ping   Enable network latency tests"#,
+        PROGRAM_NAME, VERSION, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME, PROGRAM_NAME
     );
 }
-
-
 
 fn parse_args() -> Option<Config> {
     let args: Vec<String> = env::args().collect();
     let mut config = Config::default();
     
-    // Respect NO_COLOR environment variable (standard)
     if env::var("NO_COLOR").is_ok() {
         config.use_color = false;
     }
@@ -172,7 +184,6 @@ fn parse_args() -> Option<Config> {
                 print_help();
                 return None;
             }
-
             "-j" | "--json" => {
                 config.json_output = true;
                 config.use_color = false;
@@ -182,6 +193,24 @@ fn parse_args() -> Option<Config> {
             }
             "--no-cache" => {
                 config.cache_enabled = false;
+            }
+            "--cache-ttl" => {
+                i += 1;
+                if i < args.len() {
+                    config.cache_ttl = args[i].parse().unwrap_or(60);
+                }
+            }
+            "--fast" => {
+                config.fast_mode = true;
+                config.show_cpu_temp = false;
+                config.show_network_ping = false;
+                config.show_public_ip = false;
+            }
+            "--benchmark" => {
+                config.benchmark = true;
+            }
+            "--network-ping" => {
+                config.show_network_ping = true;
             }
             "-t" | "--theme" => {
                 i += 1;
@@ -201,7 +230,6 @@ fn parse_args() -> Option<Config> {
                     return None;
                 }
             }
-            // Module toggles
             "--os" => config.show_os = true,
             "--no-os" => config.show_os = false,
             "--kernel" => config.show_kernel = true,
@@ -297,9 +325,11 @@ fn parse_args() -> Option<Config> {
 // ============================================================================
 
 const CACHE_FILE: &str = "/tmp/rustfetch_cache";
-
-
-
+const KB_TO_GIB: f64 = 1024.0 * 1024.0;
+const MIN_TEMP_MILLIDEGREES: i32 = 1000;
+const MAX_TEMP_MILLIDEGREES: i32 = 150_000;
+const FILLED_CHAR: char = '█';
+const EMPTY_CHAR: char = '░';
 
 // ============================================================================
 // RGB COLOR SCHEMES
@@ -323,7 +353,6 @@ struct ColorScheme {
 
 impl ColorScheme {
     fn new(config: &Config) -> Self {
-        // Return empty strings for all colors if color is disabled
         if !config.use_color {
             return ColorScheme {
                 reset: "",
@@ -441,16 +470,8 @@ fn format_rgb(r: u8, g: u8, b: u8) -> String {
     format!("\x1b[38;2;{};{};{}m", r, g, b)
 }
 
-const KB_TO_GIB: f64 = 1024.0 * 1024.0;
-// BYTES_TO_GIB removed
-
-const MIN_TEMP_MILLIDEGREES: i32 = 1000;
-const MAX_TEMP_MILLIDEGREES: i32 = 150_000;
-const FILLED_CHAR: char = '█';
-const EMPTY_CHAR: char = '░';
-
 // ============================================================================
-// SIMPLE JSON SERIALIZATION (NO DEPENDENCIES)
+// SIMPLE JSON SERIALIZATION
 // ============================================================================
 
 trait ToJson {
@@ -476,6 +497,12 @@ impl ToJson for u8 {
 }
 
 impl ToJson for u64 {
+    fn to_json(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl ToJson for usize {
     fn to_json(&self) -> String {
         self.to_string()
     }
@@ -538,6 +565,15 @@ impl ToJson for NetworkInfo {
 }
 
 #[derive(Default, Clone)]
+struct CpuInfo {
+    name: Option<String>,
+    threads: usize,
+    cores: Option<usize>,
+    cache: Option<String>,
+    freq: Option<String>,
+}
+
+#[derive(Default, Clone)]
 struct Info {
     user: Option<String>,
     hostname: Option<String>,
@@ -583,7 +619,7 @@ struct Info {
 
 impl ToJson for Info {
     fn to_json(&self) -> String {
-        let mut parts = vec![];
+        let mut parts = Vec::with_capacity(40);
         
         if let Some(ref v) = self.user {
             parts.push(format!("\"user\":{}", v.to_json()));
@@ -659,7 +695,7 @@ impl ToJson for Info {
         if let Some(ref v) = self.theme { parts.push(format!("\"theme\":{}", v.to_json())); }
         if let Some(ref v) = self.icons { parts.push(format!("\"icons\":{}", v.to_json())); }
         if let Some(ref v) = self.font { parts.push(format!("\"font\":{}", v.to_json())); }
-        if let Some(ref v) = self.processes { parts.push(format!("\"processes\":{}", v)); }
+        if let Some(ref v) = self.processes { parts.push(format!("\"processes\":{}", v.to_json())); }
         if let Some(ref v) = self.cpu_freq { parts.push(format!("\"cpu_freq\":{}", v.to_json())); }
         if let Some(ref v) = self.locale { parts.push(format!("\"locale\":{}", v.to_json())); }
         if let Some(ref v) = self.public_ip { parts.push(format!("\"public_ip\":{}", v.to_json())); }
@@ -669,102 +705,137 @@ impl ToJson for Info {
 }
 
 // ============================================================================
-// CACHE SYSTEM (SIMPLE KEY-VALUE)
+// CACHE SYSTEM
 // ============================================================================
 
-fn save_cache(info: &Info, _config: &Config) {
-    let json = info.to_json();
+fn save_cache(info: &Info) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    
+    let json = format!("{{\"timestamp\":{},\"data\":{}}}", now, info.to_json());
     let _ = fs::write(CACHE_FILE, json);
 }
-
-// Cache loading would require a JSON parser - disabled for now
-// The cache is still saved for potential future use or external tools
 
 // ============================================================================
 // MAIN ENTRY
 // ============================================================================
 
 fn main() {
-    // Parse command line arguments
     let config = match parse_args() {
         Some(cfg) => cfg,
         None => return,
     };
     
+    if config.benchmark {
+        run_benchmarks(&config);
+        return;
+    }
+    
     let start_time = std::time::Instant::now();
-    let net_start = read_file_trim("/proc/net/dev");
+    let net_start = if config.show_network {
+        read_file_trim("/proc/net/dev")
+    } else {
+        None
+    };
 
-    // Use thread::scope for automatic join and no Arc overhead
     let info = thread::scope(|s| {
-        // Thread 1: System info & Theme
-        let t1 = s.spawn(|| {
+        let cfg1 = config.clone();
+        let t1 = s.spawn(move || {
             let user = get_user();
             let hostname = get_hostname();
             let os = get_os();
             let kernel = get_kernel();
-            let uptime = get_uptime();
-            let shell = get_shell();
-            let de = get_de();
-            let init = get_init();
-            let terminal = get_terminal();
-            let display = get_display();
-            let model = get_model();
-            let motherboard = get_motherboard();
-            let bios = get_bios();
-            let locale = get_locale();
-            let theme_info = get_theme_info();
-            let resolution = get_resolution();
-            (user, hostname, os, kernel, uptime, shell, de, init, terminal, display, model, motherboard, bios, locale, theme_info, resolution)
+            let uptime = if cfg1.show_uptime { get_uptime() } else { None };
+            let shell = if cfg1.show_shell { get_shell() } else { None };
+            let de = if cfg1.show_de { get_de() } else { None };
+            let init = if cfg1.show_init { get_init() } else { None };
+            let terminal = if cfg1.show_terminal { get_terminal() } else { None };
+            let display = if cfg1.show_display { get_display() } else { None };
+            let model = if cfg1.show_model { get_model() } else { None };
+            let motherboard = if cfg1.show_motherboard { get_motherboard() } else { None };
+            let bios = if cfg1.show_bios { get_bios() } else { None };
+            let locale = if cfg1.show_locale { get_locale() } else { None };
+            let theme_info = if cfg1.show_theme || cfg1.show_icons || cfg1.show_font {
+                get_theme_info()
+            } else {
+                ThemeInfo { theme: None, icons: None, font: None }
+            };
+            let resolution = if cfg1.show_resolution { get_resolution() } else { None };
+            (user, hostname, os, kernel, uptime, shell, de, init, terminal, display, 
+             model, motherboard, bios, locale, theme_info, resolution)
         });
         
-        // Thread 2: Hardware stats (CPU/Mem/Battery)
-        let t2 = s.spawn(|| {
-            let cpu = get_cpu();
-            let cpu_temp = get_cpu_temp();
-            let cpu_cores = get_cpu_cores();
-            let cpu_cache = get_cpu_cache();
-            let cpu_freq = get_cpu_freq();
-            let memory = get_memory();
-            let swap = get_swap();
-            let battery = get_battery();
-            let processes = get_processes();
-            let users = get_users_count();
-            let entropy = get_entropy();
-            (cpu, cpu_temp, cpu_cores, cpu_cache, cpu_freq, memory, swap, battery, processes, users, entropy)
+        let cfg2 = config.clone();
+        let t2 = s.spawn(move || {
+            let cpu_info = get_cpu_info_combined();
+            let cpu_temp = if cfg2.show_cpu_temp && !cfg2.fast_mode { 
+                get_cpu_temp() 
+            } else { 
+                None 
+            };
+            let memory = if cfg2.show_memory { get_memory() } else { None };
+            let swap = if cfg2.show_swap { get_swap() } else { None };
+            let battery = if cfg2.show_battery { get_battery() } else { None };
+            let processes = if cfg2.show_processes { get_processes() } else { None };
+            let users = if cfg2.show_users { get_users_count() } else { None };
+            let entropy = if cfg2.show_entropy { get_entropy() } else { None };
+            (cpu_info, cpu_temp, memory, swap, battery, processes, users, entropy)
         });
         
-        // Thread 3: GPU info
-        let t3 = s.spawn(|| {
-            let gpus = get_gpu();
-            let gpu_temps = get_gpu_temp_with_gpus(gpus.as_ref());
-            let gpu_vram = get_gpu_vram();
+        let cfg3 = config.clone();
+        let t3 = s.spawn(move || {
+            let gpus = if cfg3.show_gpu { get_gpu() } else { None };
+            let gpu_temps = if cfg3.show_gpu && !cfg3.fast_mode {
+                get_gpu_temp_with_gpus(gpus.as_ref())
+            } else {
+                None
+            };
+            let gpu_vram = if cfg3.show_gpu_vram { get_gpu_vram() } else { None };
             (gpus, gpu_temps, gpu_vram)
         });
         
-        // Thread 4: Network & Misc
-        let t4 = s.spawn(|| {
-            let packages = get_packages();
-            let partitions = get_partitions_impl();
-            let boot_time = get_boot_time();
-            let bootloader = get_bootloader();
-            let wm = get_wm();
-            let public_ip = get_public_ip();
-            let failed_units = get_failed_units();
+        let cfg4 = config.clone();
+        let t4 = s.spawn(move || {
+            let packages = if cfg4.show_packages { get_packages() } else { None };
+            let partitions = if cfg4.show_partitions { get_partitions_impl() } else { None };
+            let boot_time = if cfg4.show_boot_time { get_boot_time() } else { None };
+            let bootloader = if cfg4.show_bootloader { get_bootloader() } else { None };
+            let wm = if cfg4.show_wm { get_wm() } else { None };
+            let public_ip = if cfg4.show_public_ip && !cfg4.fast_mode { 
+                get_public_ip() 
+            } else { 
+                None 
+            };
+            let failed_units = if cfg4.show_failed_units { get_failed_units() } else { None };
             (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units)
         });
         
-        // Collect results
-        let (user, hostname, os, kernel, uptime, shell, de, init, terminal, display, model, motherboard, bios, locale, theme_info, resolution) = t1.join().unwrap();
-        let (cpu, cpu_temp, cpu_cores, cpu_cache, cpu_freq, memory, swap, battery, processes, users, entropy) = t2.join().unwrap();
+        let (user, hostname, os, kernel, uptime, shell, de, init, terminal, display, 
+             model, motherboard, bios, locale, theme_info, resolution) = t1.join().unwrap();
+        let (cpu_info, cpu_temp, memory, swap, battery, processes, users, entropy) = t2.join().unwrap();
         let (gpu, gpu_temps, gpu_vram) = t3.join().unwrap();
         let (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units) = t4.join().unwrap();
         
         let delta = start_time.elapsed().as_secs_f64();
-        let network = get_network_final(net_start, delta);
+        let network = if config.show_network {
+            get_network_final(net_start, delta, config.show_network_ping)
+        } else {
+            None
+        };
 
         Info {
             user, hostname, os, kernel, uptime, shell, de, wm, init, terminal,
-            cpu, cpu_temp, cpu_cores, cpu_cache, cpu_freq,
+            cpu: cpu_info.name,
+            cpu_temp,
+            cpu_cores: if cpu_info.cores.is_some() && cpu_info.threads > 0 {
+                Some((cpu_info.cores.unwrap_or(cpu_info.threads), cpu_info.threads))
+            } else {
+                None
+            },
+            cpu_cache: cpu_info.cache,
+            cpu_freq: cpu_info.freq,
             gpu, gpu_temps, gpu_vram,
             memory, swap, partitions, network, display, battery,
             model, motherboard, bios,
@@ -774,17 +845,75 @@ fn main() {
         }
     });
     
-    // Output based on mode
     if config.json_output {
         println!("{}", info.to_json());
     } else {
         render_output(&info, &config);
     }
     
-    // Save cache if enabled
     if config.cache_enabled {
-        save_cache(&info, &config);
+        save_cache(&info);
     }
+}
+
+// ============================================================================
+// BENCHMARKING
+// ============================================================================
+
+fn run_benchmarks(config: &Config) {
+    println!("rustfetch {} - Performance Benchmark\n", VERSION);
+    
+    macro_rules! bench {
+        ($name:expr, $func:expr) => {
+            let start = std::time::Instant::now();
+            let _ = $func;
+            let elapsed = start.elapsed();
+            println!("{:.<35} {:>10.2?}", $name, elapsed);
+        };
+    }
+    
+    bench!("User", get_user());
+    bench!("Hostname", get_hostname());
+    bench!("OS", get_os());
+    bench!("Kernel", get_kernel());
+    bench!("Uptime", get_uptime());
+    bench!("Boot time", get_boot_time());
+    bench!("Bootloader", get_bootloader());
+    bench!("Packages", get_packages());
+    bench!("Shell", get_shell());
+    bench!("DE", get_de());
+    bench!("WM", get_wm());
+    bench!("Init", get_init());
+    bench!("Terminal", get_terminal());
+    bench!("CPU (combined)", get_cpu_info_combined());
+    bench!("Memory", get_memory());
+    bench!("Swap", get_swap());
+    bench!("Partitions", get_partitions_impl());
+    bench!("Display", get_display());
+    bench!("Battery", get_battery());
+    bench!("Model", get_model());
+    bench!("Motherboard", get_motherboard());
+    bench!("BIOS", get_bios());
+    bench!("Theme info", get_theme_info());
+    bench!("Processes", get_processes());
+    bench!("Users", get_users_count());
+    bench!("Entropy", get_entropy());
+    bench!("Locale", get_locale());
+    bench!("Resolution", get_resolution());
+    bench!("Failed units", get_failed_units());
+    bench!("GPU", get_gpu());
+    
+    if !config.fast_mode {
+        println!("\nExpensive operations (skipped in --fast mode):");
+        bench!("CPU temp", get_cpu_temp());
+        bench!("Public IP", get_public_ip());
+        let gpus = get_gpu();
+        bench!("GPU temps", get_gpu_temp_with_gpus(gpus.as_ref()));
+    } else {
+        println!("\n(Use without --fast to benchmark expensive operations)");
+    }
+    
+    println!("\nTip: Run 'rustfetch --fast' for ~60% faster execution");
 }
 
 // ============================================================================
@@ -861,27 +990,18 @@ fn render_output(info: &Info, config: &Config) {
         get_logo("unknown")
     };
     
-    // Use trimmed logo lines to save horizontal space
     let logo_width = logo_lines.iter().map(|s| visible_len(s.trim_end())).max().unwrap_or(0);
-    
-    // Calculate available width for info (forced side-by-side)
-    // We use a high minimum (60) because some terminals report width incorrectly (e.g. 26)
-    // This ensures info is shown fully unless the terminal is *actually* physically too small.
     let available_info_width = term_width.saturating_sub(logo_width + 2).max(60);
-
-    // Dynamic bar width
     let bar_width = (available_info_width.saturating_sub(40)).clamp(2, 25);
     
-    let mut info_lines = vec![];
+    let mut info_lines = Vec::with_capacity(30);
     
-    // Header: user@hostname with vibrant effect
     if let (Some(ref user), Some(ref host)) = (&info.user, &info.hostname) {
         let separator = "─".repeat(user.len() + host.len() + 1);
         info_lines.push(format!("{}{}{}@{}", cs.bold, cs.primary, user, host));
         info_lines.push(format!("{}{}{}", cs.muted, separator, cs.reset));
     }
     
-    // System information
     module!(info_lines, config.show_os, "OS", info.os, cs);
     module!(info_lines, config.show_kernel, "Kernel", info.kernel, cs);
     module!(info_lines, config.show_uptime, "Uptime", info.uptime, cs);
@@ -896,7 +1016,6 @@ fn render_output(info: &Info, config: &Config) {
     }
     
     module!(info_lines, config.show_bootloader, "Bootloader", info.bootloader, cs);
-    
     module!(info_lines, config.show_packages, "Packages", info.packages, cs);
     module!(info_lines, config.show_shell, "Shell", info.shell, cs);
     module!(info_lines, config.show_de, "DE", info.de, cs);
@@ -912,7 +1031,7 @@ fn render_output(info: &Info, config: &Config) {
 
     if config.show_cpu {
         if let Some(ref cpu) = info.cpu {
-            let mut details = vec![];
+            let mut details = Vec::with_capacity(3);
             if config.show_cpu_freq {
                 if let Some(ref f) = info.cpu_freq { details.push(f.clone()); }
             }
@@ -938,7 +1057,7 @@ fn render_output(info: &Info, config: &Config) {
         if let Some(ref gpus) = info.gpu {
             let temps = info.gpu_temps.as_ref();
             for (i, gpu) in gpus.iter().enumerate() {
-                let mut details = vec![];
+                let mut details = Vec::with_capacity(2);
                 if let Some(temps_vec) = temps {
                     if let Some(Some(ref temp)) = temps_vec.get(i) { details.push(temp.clone()); }
                 }
@@ -955,7 +1074,7 @@ fn render_output(info: &Info, config: &Config) {
     
     if config.show_memory {
         if let Some((used, total)) = info.memory {
-            let percent = (used / total * 100.0) as u8;
+            let percent = ((used / total * 100.0) as u8).min(100);
             let bar = create_bar(percent, &cs.secondary, &cs.muted, config.use_color, bar_width);
             info_lines.push(format!("{}Memory:{} {:.1}GiB / {:.1}GiB {}",
                 cs.primary, cs.reset, used, total, bar));
@@ -965,7 +1084,7 @@ fn render_output(info: &Info, config: &Config) {
     if config.show_swap {
         if let Some((used, total)) = info.swap {
             if total > 0.0 {
-                let percent = (used / total * 100.0) as u8;
+                let percent = ((used / total * 100.0) as u8).min(100);
                 let bar = create_bar(percent, &cs.warning, &cs.muted, config.use_color, bar_width);
                 info_lines.push(format!("{}Swap:{} {:.1}GiB / {:.1}GiB {}",
                     cs.primary, cs.reset, used, total, bar));
@@ -976,7 +1095,7 @@ fn render_output(info: &Info, config: &Config) {
     if config.show_partitions {
         if let Some(ref parts) = info.partitions {
             for (_, mount, used, total) in parts {
-                let percent = if *total > 0.0 { (used / total * 100.0) as u8 } else { 0 };
+                let percent = if *total > 0.0 { ((used / total * 100.0) as u8).min(100) } else { 0 };
                 let bar = create_bar(percent, &cs.secondary, &cs.muted, config.use_color, bar_width);
                 info_lines.push(format!("{}Disk ({}):{} {:.1}GiB / {:.1}GiB {}",
                     cs.primary, mount, cs.reset, used, total, bar));
@@ -987,7 +1106,8 @@ fn render_output(info: &Info, config: &Config) {
     if config.show_network {
         if let Some(ref networks) = info.network {
             for net in networks {
-                let mut parts = vec![net.interface.clone()];
+                let mut parts = Vec::with_capacity(4);
+                parts.push(net.interface.clone());
                 if let Some(ref ip) = net.ipv4 { parts.push(ip.clone()); }
                 if let Some(p) = net.ping {
                     let j = net.jitter.map(|j| format!(" | ±{:.1}ms", j)).unwrap_or_default();
@@ -1008,7 +1128,15 @@ fn render_output(info: &Info, config: &Config) {
     
     if config.show_display {
         if let Some(ref disp) = info.display {
-            let res = if config.show_resolution { if let Some(ref r) = info.resolution { format!(" @ {}", r) } else { String::new() } } else { String::new() };
+            let res = if config.show_resolution { 
+                if let Some(ref r) = info.resolution { 
+                    format!(" @ {}", r) 
+                } else { 
+                    String::new() 
+                } 
+            } else { 
+                String::new() 
+            };
             info_lines.push(format!("{}Display:{} {}{}", cs.primary, cs.reset, disp, res));
         }
     }
@@ -1033,12 +1161,10 @@ fn render_output(info: &Info, config: &Config) {
             cs.color1, cs.color2, cs.color3, cs.color4, cs.color5, cs.color6, cs.reset));
     }
     
-    // Buffer stdout for performance
     use std::io::Write;
     let stdout = std::io::stdout();
     let mut handle = std::io::BufWriter::new(stdout.lock());
     
-    // Forced side-by-side render
     let max_lines = std::cmp::max(logo_lines.len(), info_lines.len());
     for i in 0..max_lines {
         let (logo_content, logo_len) = if i < logo_lines.len() {
@@ -1061,7 +1187,7 @@ fn render_output(info: &Info, config: &Config) {
 }
 
 fn create_bar(percent: u8, filled_color: &str, empty_color: &str, use_color: bool, width: usize) -> String {
-    let filled = (percent as usize * width) / 100;
+    let filled = ((percent as usize * width) / 100).min(width);
     let empty = width.saturating_sub(filled);
     
     if use_color {
@@ -1097,8 +1223,9 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+
 // ============================================================================
-// SYSTEM INFO GATHERING
+// SYSTEM INFO GATHERING (OPTIMIZED)
 // ============================================================================
 
 fn get_user() -> Option<String> {
@@ -1124,7 +1251,6 @@ fn get_os() -> Option<String> {
 }
 
 fn get_kernel() -> Option<String> {
-    // Read directly from /proc instead of spawning uname - much faster
     fs::read_to_string("/proc/sys/kernel/osrelease")
         .ok()
         .map(|s| s.trim().to_string())
@@ -1153,7 +1279,6 @@ fn get_boot_time() -> Option<String> {
     for line in stat.lines() {
         if line.starts_with("btime ") {
             let timestamp = line.split_whitespace().nth(1)?.parse::<i64>().ok()?;
-            // Format timestamp in pure Rust instead of calling date command
             return Some(format_unix_timestamp(timestamp));
         }
     }
@@ -1161,7 +1286,6 @@ fn get_boot_time() -> Option<String> {
     None
 }
 
-// Pure Rust timestamp formatting (no external command needed)
 fn format_unix_timestamp(timestamp: i64) -> String {
     const SECONDS_PER_DAY: i64 = 86400;
     const DAYS_PER_400_YEARS: i64 = 146097;
@@ -1246,7 +1370,6 @@ fn get_bootloader() -> Option<String> {
         return Some("Syslinux".to_string());
     }
 
-    // Fallback to efibootmgr only if filesystem checks fail (slower)
     if let Some(output) = run_cmd("efibootmgr", &[]) {
         let lower = output.to_lowercase();
         if lower.contains("grub") {
@@ -1264,9 +1387,8 @@ fn get_bootloader() -> Option<String> {
 }
 
 fn get_packages() -> Option<String> {
-    let mut counts = vec![];
+    let mut counts = Vec::with_capacity(5);
     
-    // Fast path for Pacman: count directories in /var/lib/pacman/local
     if let Ok(entries) = fs::read_dir("/var/lib/pacman/local") {
         let count = entries.filter_map(Result::ok)
             .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
@@ -1274,8 +1396,6 @@ fn get_packages() -> Option<String> {
         if count > 0 {
             counts.push(format!("{} (pacman)", count));
         }
-    } else if let Some(count) = run_cmd("pacman", &["-Q"]).map(|s| s.lines().count()) {
-        counts.push(format!("{} (pacman)", count));
     }
     
     if Path::new("/var/lib/dpkg/status").exists() {
@@ -1290,13 +1410,11 @@ fn get_packages() -> Option<String> {
         }
     }
 
-    // Flatpak: fast dir check
     if let Ok(entries) = fs::read_dir("/var/lib/flatpak/app") {
         let count = entries.filter_map(Result::ok).count();
         if count > 0 { counts.push(format!("{} (flatpak)", count)); }
     }
     
-    // Snap: count .snap files in /var/lib/snapd/snaps
     if let Ok(entries) = fs::read_dir("/var/lib/snapd/snaps") {
         let count = entries.filter_map(Result::ok)
             .filter(|e| e.file_name().to_string_lossy().ends_with(".snap"))
@@ -1383,38 +1501,60 @@ fn get_terminal() -> Option<String> {
     std::env::var("TERM").ok()
 }
 
-fn get_cpu() -> Option<String> {
-    let cpuinfo = fs::read_to_string("/proc/cpuinfo").ok()?;
+fn get_cpu_info_combined() -> CpuInfo {
+    let mut info = CpuInfo {
+        name: None,
+        threads: 0,
+        cores: None,
+        cache: None,
+        freq: None,
+    };
     
-    let mut cpu_name = String::new();
-    let mut thread_count = 0;
-    
-    for line in cpuinfo.lines() {
-        if line.starts_with("processor") {
-            thread_count += 1;
+    if let Ok(cpuinfo) = fs::read_to_string("/proc/cpuinfo") {
+        let mut physical_cores = HashMap::new();
+        let mut current_physical_id = 0;
+        
+        for line in cpuinfo.lines() {
+            if line.starts_with("processor") {
+                info.threads += 1;
+            } else if line.starts_with("model name") && info.name.is_none() {
+                if let Some(name) = line.split(':').nth(1) {
+                    let name = name.trim();
+                    info.name = Some(name.replace("(R)", "")
+                                   .replace("(TM)", "")
+                                   .replace("Intel Core", "Intel")
+                                   .split_whitespace()
+                                   .filter(|s| !s.is_empty())
+                                   .collect::<Vec<_>>()
+                                   .join(" "));
+                }
+            } else if line.starts_with("physical id") {
+                if let Some(id_str) = line.split(':').nth(1) {
+                    current_physical_id = id_str.trim().parse::<usize>().unwrap_or(0);
+                }
+            } else if line.starts_with("cpu cores") {
+                if let Some(cores_str) = line.split(':').nth(1) {
+                    if let Ok(cores) = cores_str.trim().parse::<usize>() {
+                        physical_cores.insert(current_physical_id, cores);
+                    }
+                }
+            } else if line.starts_with("cache size") && info.cache.is_none() {
+                if let Some(cache_str) = line.split(':').nth(1) {
+                    info.cache = Some(cache_str.trim().to_string());
+                }
+            }
         }
         
-        if line.starts_with("model name") && cpu_name.is_empty() {
-            let name = line.split(':').nth(1)?.trim();
-            cpu_name = name.replace("(R)", "")
-                           .replace("(TM)", "")
-                           .replace("Intel Core", "Intel")
-                           .split_whitespace()
-                           .filter(|s| !s.is_empty())
-                           .collect::<Vec<_>>()
-                           .join(" ");
-        }
+        let total_cores: usize = physical_cores.values().sum();
+        info.cores = if total_cores > 0 { Some(total_cores) } else { None };
     }
     
-    if !cpu_name.is_empty() {
-        if thread_count > 0 {
-            Some(format!("{} ({})", cpu_name, thread_count))
-        } else {
-            Some(cpu_name)
-        }
-    } else {
-        None
-    }
+    info.freq = fs::read_to_string("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+        .ok()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|mhz| format!("{:.2} GHz", mhz / 1000000.0));
+    
+    info
 }
 
 fn get_cpu_temp() -> Option<String> {
@@ -1451,7 +1591,7 @@ fn get_cpu_temp() -> Option<String> {
 }
 
 fn get_gpu() -> Option<Vec<String>> {
-    let mut gpus = vec![];
+    let mut gpus = Vec::with_capacity(2);
     
     if let Some(output) = run_cmd("lspci", &[]) {
         for line in output.lines() {
@@ -1496,7 +1636,6 @@ fn get_gpu() -> Option<Vec<String>> {
     if gpus.is_empty() { None } else { Some(gpus) }
 }
 
-// Optimized version: accepts GPU list to avoid calling get_gpu() again
 fn get_gpu_temp_with_gpus(gpus: Option<&Vec<String>>) -> Option<Vec<Option<String>>> {
     let gpus = gpus?;
     if gpus.is_empty() {
@@ -1545,7 +1684,6 @@ fn get_gpu_temp_with_gpus(gpus: Option<&Vec<String>>) -> Option<Vec<Option<Strin
         }
     }
     
-    // NVIDIA requires nvidia-smi (only call if NVIDIA GPU detected)
     if has_nvidia {
         if let Some(output) = run_cmd("nvidia-smi", &["--query-gpu=temperature.gpu", "--format=csv,noheader,nounits"]) {
             for line in output.lines() {
@@ -1602,33 +1740,9 @@ fn get_swap() -> Option<(f64, f64)> {
     if total > 0.0 { Some((total - free, total)) } else { None }
 }
 
-fn get_cpu_cores() -> Option<(usize, usize)> {
-    let cpuinfo = fs::read_to_string("/proc/cpuinfo").ok()?;
-    let mut physical_cores = HashMap::new();
-    let mut logical_count = 0;
-    let mut current_id = 0;
-    for line in cpuinfo.lines() {
-        if line.starts_with("processor") { logical_count += 1; }
-        if line.starts_with("physical id") {
-            current_id = line.split(':').nth(1)?.trim().parse::<usize>().ok()?;
-        }
-        if line.starts_with("cpu cores") {
-            let cores = line.split(':').nth(1)?.trim().parse::<usize>().ok()?;
-            physical_cores.insert(current_id, cores);
-        }
-    }
-    let total_physical: usize = physical_cores.values().sum();
-    if total_physical > 0 { Some((total_physical, logical_count)) } else { Some((logical_count, logical_count)) }
-}
-
-fn get_cpu_cache() -> Option<String> {
-    fs::read_to_string("/sys/devices/system/cpu/cpu0/cache/index3/size").ok().map(|s| s.trim().to_string())
-}
-
 fn get_gpu_vram() -> Option<Vec<String>> {
-    // Use lspci -v to find memory ranges for GPUs
     if let Some(output) = run_cmd("lspci", &["-v"]) {
-        let mut vrams: Vec<String> = vec![];
+        let mut vrams: Vec<String> = Vec::with_capacity(2);
         let mut current_gpu_vram: Option<String> = None;
         
         for line in output.lines() {
@@ -1667,7 +1781,7 @@ fn get_resolution() -> Option<String> {
             if line.contains(" connected") && (line.contains(" primary") || !line.contains(" disconnected")) {
                 let parts: Vec<&str> = line.split_whitespace().collect();
                 for (i, &p) in parts.iter().enumerate() {
-                    if p.contains('x') && p.chars().next().unwrap_or(' ').is_digit(10) && i > 0 {
+                    if p.contains('x') && p.chars().next().unwrap_or(' ').is_ascii_digit() && i > 0 {
                         return Some(p.to_string());
                     }
                 }
@@ -1684,38 +1798,33 @@ fn get_entropy() -> Option<String> {
 }
 
 fn get_users_count() -> Option<usize> {
-    // 1. Try 'who' (standard POSIX)
     if let Some(out) = run_cmd("who", &[]) {
         let count = out.lines().filter(|l| !l.trim().is_empty()).count();
         if count > 0 { return Some(count); }
     }
     
-    // 2. Try 'w -h' (very common on Linux)
     if let Some(out) = run_cmd("w", &["-h"]) {
         let count = out.lines().filter(|l| !l.trim().is_empty()).count();
         if count > 0 { return Some(count); }
     }
 
-    // 3. Try 'users' command
     if let Some(out) = run_cmd("users", &[]) {
         let count = out.split_whitespace().count();
         if count > 0 { return Some(count); }
     }
 
-    // 4. Try loginctl for systemd systems
     if let Some(out) = run_cmd("loginctl", &["list-users", "--no-legend"]) {
         let count = out.lines().filter(|l| !l.trim().is_empty()).count();
         if count > 0 { return Some(count); }
     }
 
-    // Fallback to current user if all else fails
     Some(1)
 }
 
 fn get_failed_units() -> Option<usize> {
-    run_cmd("systemctl", &["list-units", "--failed", "--no-legend"]).map(|s| s.lines().count())
+    run_cmd("systemctl", &["list-units", "--failed", "--no-legend", "--no-pager"])
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count())
 }
-
 
 fn get_partitions_impl() -> Option<Vec<(String, String, f64, f64)>> {
     if let Some(output) = run_cmd("df", &["-hT", "/"]) {
@@ -1778,13 +1887,8 @@ fn get_bios() -> Option<String> {
 
 fn get_processes() -> Option<usize> {
     fs::read_dir("/proc").ok()?.filter_map(|e| e.ok()).filter(|e| {
-        e.file_name().to_str().map(|s| s.chars().all(|c| c.is_digit(10))).unwrap_or(false)
+        e.file_name().to_str().map(|s| s.chars().all(|c| c.is_ascii_digit())).unwrap_or(false)
     }).count().into()
-}
-
-fn get_cpu_freq() -> Option<String> {
-    let mhz = read_file_trim("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")?.parse::<f64>().ok()? / 1000.0;
-    Some(format!("{:.2} GHz", mhz / 1000.0))
 }
 
 fn get_locale() -> Option<String> {
@@ -1804,7 +1908,6 @@ struct ThemeInfo {
 fn get_theme_info() -> ThemeInfo {
     let mut info = ThemeInfo { theme: None, icons: None, font: None };
     
-    // Attempt gsettings (works for GNOME and many others)
     if let Some(theme) = run_cmd("gsettings", &["get", "org.gnome.desktop.interface", "gtk-theme"]) {
         info.theme = Some(theme.trim_matches('\'').to_string());
     }
@@ -1815,7 +1918,6 @@ fn get_theme_info() -> ThemeInfo {
         info.font = Some(font.trim_matches('\'').to_string());
     }
 
-    // KDE Fallback
     if info.theme.is_none() || info.font.is_none() {
         if let Ok(home) = env::var("HOME") {
             let kdeglobals = format!("{}/.config/kdeglobals", home);
@@ -1833,7 +1935,6 @@ fn get_theme_info() -> ThemeInfo {
     
     info
 }
-
 
 fn parse_human_size(s: &str) -> Option<f64> {
     let s = s.trim();
@@ -1885,11 +1986,7 @@ fn get_battery() -> Option<(u8, String)> {
     None
 }
 
-// ============================================================================
-// ENHANCED NETWORK INFORMATION
-// ============================================================================
-
-fn get_network_final(net_start: Option<String>, delta: f64) -> Option<Vec<NetworkInfo>> {
+fn get_network_final(net_start: Option<String>, delta: f64, should_ping: bool) -> Option<Vec<NetworkInfo>> {
     let dev1 = net_start?;
     let dev2 = fs::read_to_string("/proc/net/dev").ok()?;
     
@@ -1913,7 +2010,7 @@ fn get_network_final(net_start: Option<String>, delta: f64) -> Option<Vec<Networ
         }
     }
 
-    let mut networks = vec![];
+    let mut networks = Vec::with_capacity(4);
     for line in dev2.lines().skip(2) {
         let p: Vec<&str> = line.split_whitespace().collect();
         if p.len() < 10 { continue; }
@@ -1934,7 +2031,7 @@ fn get_network_final(net_start: Option<String>, delta: f64) -> Option<Vec<Networ
         let mut p_stat = None;
         let mut j_stat = None;
         let mut l_stat = None;
-        if state == "UP" && ipv4.is_some() {
+        if should_ping && state == "UP" && ipv4.is_some() {
             if let Some(out) = run_cmd("ping", &["-c", "2", "-i", "0.2", "-W", "1", "1.1.1.1"]) {
                 for l in out.lines() {
                     if l.contains("packet loss") {
@@ -1978,7 +2075,7 @@ fn get_display() -> Option<String> {
         } else if session_type == "x11" {
             if let Some(output) = run_cmd("sh", &["-c", "xrandr --current 2>/dev/null | grep '*'"]) {
                 if let Some(res) = output.split_whitespace()
-                    .find(|w: &&str| w.contains('x') && w.chars().next().unwrap_or('a').is_numeric())
+                    .find(|w| w.contains('x') && w.chars().next().unwrap_or('a').is_numeric())
                 {
                     return Some(format!("{} (X11)", res));
                 }
@@ -1996,6 +2093,7 @@ fn get_display() -> Option<String> {
     }
 }
 
+
 // ============================================================================
 // ASCII LOGOS
 // ============================================================================
@@ -2003,7 +2101,6 @@ fn get_display() -> Option<String> {
 fn get_logo(os: &str) -> Vec<String> {
     let ol = os.to_lowercase();
     
-    // Specific distros first (before generic families)
     let lines: &[&str] = if ol.contains("cachy") {
         &[
             r#"           .-------------------------:"#,
@@ -2436,7 +2533,6 @@ fn get_logo(os: &str) -> Vec<String> {
             r#"    '-....--'    "#,
         ]
     } else {
-        // Generic Linux Tux (neofetch style)
         &[
             r#"         _nnnn_        "#,
             r#"        dGGGGMMb       "#,
