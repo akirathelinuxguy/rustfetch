@@ -734,96 +734,93 @@ fn main() {
     }
     
     let start_time = std::time::Instant::now();
-    let net_start = if config.show_network {
-        read_file_trim("/proc/net/dev")
-    } else {
-        None
-    };
+    // Snapshot /proc/net/dev as early as possible for bandwidth delta
+    let net_start = if config.show_network { read_file_trim("/proc/net/dev") } else { None };
 
     let info = thread::scope(|s| {
+        // ── Thread 1: pure env + file reads. ZERO spawns. ──
         let cfg1 = config.clone();
         let t1 = s.spawn(move || {
-            let user = get_user();
-            let hostname = get_hostname();
-            let os = get_os();
-            let kernel = get_kernel();
-            let uptime = if cfg1.show_uptime { get_uptime() } else { None };
-            let shell = if cfg1.show_shell { get_shell() } else { None };
-            let de = if cfg1.show_de { get_de() } else { None };
-            let init = if cfg1.show_init { get_init() } else { None };
-            let terminal = if cfg1.show_terminal { get_terminal() } else { None };
-            let display = if cfg1.show_display { get_display() } else { None };
-            let model = if cfg1.show_model { get_model() } else { None };
+            let user        = get_user();
+            let hostname    = get_hostname();
+            let os          = get_os();
+            let kernel      = get_kernel();
+            let uptime      = if cfg1.show_uptime    { get_uptime() }    else { None };
+            let shell       = if cfg1.show_shell     { get_shell() }     else { None };
+            let de          = if cfg1.show_de        { get_de() }        else { None };
+            let init        = if cfg1.show_init      { get_init() }      else { None };
+            let terminal    = if cfg1.show_terminal  { get_terminal() }  else { None };
+            let locale      = if cfg1.show_locale    { get_locale() }    else { None };
+            let model       = if cfg1.show_model     { get_model() }     else { None };
             let motherboard = if cfg1.show_motherboard { get_motherboard() } else { None };
-            let bios = if cfg1.show_bios { get_bios() } else { None };
-            let locale = if cfg1.show_locale { get_locale() } else { None };
-            let theme_info = if cfg1.show_theme || cfg1.show_icons || cfg1.show_font {
-                get_theme_info()
-            } else {
-                ThemeInfo { theme: None, icons: None, font: None }
-            };
-            let resolution = if cfg1.show_resolution { get_resolution() } else { None };
-            (user, hostname, os, kernel, uptime, shell, de, init, terminal, display, 
-             model, motherboard, bios, locale, theme_info, resolution)
+            let bios        = if cfg1.show_bios      { get_bios() }      else { None };
+            (user, hostname, os, kernel, uptime, shell, de, init, terminal, locale, model, motherboard, bios)
         });
-        
+
+        // ── Thread 2: cpu, mem+swap (1 read), battery, processes, users, entropy ──
         let cfg2 = config.clone();
         let t2 = s.spawn(move || {
-            let cpu_info = get_cpu_info_combined();
-            let cpu_temp = if cfg2.show_cpu_temp && !cfg2.fast_mode { 
-                get_cpu_temp() 
-            } else { 
-                None 
-            };
-            let memory = if cfg2.show_memory { get_memory() } else { None };
-            let swap = if cfg2.show_swap { get_swap() } else { None };
-            let battery = if cfg2.show_battery { get_battery() } else { None };
-            let processes = if cfg2.show_processes { get_processes() } else { None };
-            let users = if cfg2.show_users { get_users_count() } else { None };
-            let entropy = if cfg2.show_entropy { get_entropy() } else { None };
+            let cpu_info  = get_cpu_info_combined();
+            let cpu_temp  = if cfg2.show_cpu_temp && !cfg2.fast_mode { get_cpu_temp() } else { None };
+            let (memory, swap) = if cfg2.show_memory || cfg2.show_swap { get_memory_and_swap() } else { (None, None) };
+            let battery   = if cfg2.show_battery   { get_battery() }     else { None };
+            let processes = if cfg2.show_processes { get_processes() }   else { None };
+            let users     = if cfg2.show_users     { get_users_count() } else { None };
+            let entropy   = if cfg2.show_entropy   { get_entropy() }     else { None };
             (cpu_info, cpu_temp, memory, swap, battery, processes, users, entropy)
         });
-        
+
+        // ── Thread 3: single lspci -v → gpu names + vram, then gpu temps ──
         let cfg3 = config.clone();
         let t3 = s.spawn(move || {
-            let gpus = if cfg3.show_gpu { get_gpu() } else { None };
+            let (gpus, gpu_vram) = if cfg3.show_gpu || cfg3.show_gpu_vram {
+                get_gpu_combined()
+            } else { (None, None) };
             let gpu_temps = if cfg3.show_gpu && !cfg3.fast_mode {
                 get_gpu_temp_with_gpus(gpus.as_ref())
-            } else {
-                None
-            };
-            let gpu_vram = if cfg3.show_gpu_vram { get_gpu_vram() } else { None };
+            } else { None };
             (gpus, gpu_temps, gpu_vram)
         });
-        
+
+        // ── Thread 4: packages, partitions (statfs), bootloader, wm, failed, theme ──
         let cfg4 = config.clone();
         let t4 = s.spawn(move || {
-            let packages = if cfg4.show_packages { get_packages() } else { None };
-            let partitions = if cfg4.show_partitions { get_partitions_impl() } else { None };
-            let boot_time = if cfg4.show_boot_time { get_boot_time() } else { None };
-            let bootloader = if cfg4.show_bootloader { get_bootloader() } else { None };
-            let wm = if cfg4.show_wm { get_wm() } else { None };
-            let public_ip = if cfg4.show_public_ip && !cfg4.fast_mode { 
-                get_public_ip() 
-            } else { 
-                None 
-            };
+            let packages     = if cfg4.show_packages     { get_packages() }     else { None };
+            let partitions   = if cfg4.show_partitions   { get_partitions_impl() } else { None };
+            let boot_time    = if cfg4.show_boot_time    { get_boot_time() }    else { None };
+            let bootloader   = if cfg4.show_bootloader   { get_bootloader() }   else { None };
+            let wm           = if cfg4.show_wm           { get_wm() }           else { None };
+            let public_ip    = if cfg4.show_public_ip && !cfg4.fast_mode { get_public_ip() } else { None };
             let failed_units = if cfg4.show_failed_units { get_failed_units() } else { None };
-            (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units)
+            let theme_info   = if cfg4.show_theme || cfg4.show_icons || cfg4.show_font {
+                get_theme_info()
+            } else { ThemeInfo { theme: None, icons: None, font: None } };
+            (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units, theme_info)
         });
-        
-        let (user, hostname, os, kernel, uptime, shell, de, init, terminal, display, 
-             model, motherboard, bios, locale, theme_info, resolution) = t1.join().unwrap();
+
+        // ── Thread 5: display+resolution (1 xrandr) + prefetch ip for network ──
+        let cfg5 = config.clone();
+        let t5 = s.spawn(move || {
+            let (display, resolution) = if cfg5.show_display || cfg5.show_resolution {
+                get_display_and_resolution()
+            } else { (None, None) };
+            // Prefetch ip output so network assembly after join has zero extra latency
+            let ip_out = if cfg5.show_network { run_cmd("ip", &["-o", "addr", "show"]) } else { None };
+            (display, resolution, ip_out)
+        });
+
+        // ── join ──
+        let (user, hostname, os, kernel, uptime, shell, de, init, terminal, locale, model, motherboard, bios) = t1.join().unwrap();
         let (cpu_info, cpu_temp, memory, swap, battery, processes, users, entropy) = t2.join().unwrap();
         let (gpu, gpu_temps, gpu_vram) = t3.join().unwrap();
-        let (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units) = t4.join().unwrap();
-        
-        let delta = start_time.elapsed().as_secs_f64();
+        let (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units, theme_info) = t4.join().unwrap();
+        let (display, resolution, ip_out) = t5.join().unwrap();
+
+        // Network: uses pre-fetched ip output — no spawn on critical path
         let network = if config.show_network {
-            get_network_final(net_start, delta, config.show_network_ping)
-        } else {
-            None
-        };
+            let delta = start_time.elapsed().as_secs_f64();
+            get_network_final_with_ip(net_start, delta, config.show_network_ping, ip_out)
+        } else { None };
 
         Info {
             user, hostname, os, kernel, uptime, shell, de, wm, init, terminal,
@@ -831,9 +828,7 @@ fn main() {
             cpu_temp,
             cpu_cores: if cpu_info.cores.is_some() && cpu_info.threads > 0 {
                 Some((cpu_info.cores.unwrap_or(cpu_info.threads), cpu_info.threads))
-            } else {
-                None
-            },
+            } else { None },
             cpu_cache: cpu_info.cache,
             cpu_freq: cpu_info.freq,
             gpu, gpu_temps, gpu_vram,
@@ -851,8 +846,10 @@ fn main() {
         render_output(&info, &config);
     }
     
+    // Fire-and-forget cache write — doesn't block exit
     if config.cache_enabled {
-        save_cache(&info);
+        let info_c = info.clone();
+        std::thread::spawn(move || save_cache(&info_c));
     }
 }
 
@@ -886,10 +883,9 @@ fn run_benchmarks(config: &Config) {
     bench!("Init", get_init());
     bench!("Terminal", get_terminal());
     bench!("CPU (combined)", get_cpu_info_combined());
-    bench!("Memory", get_memory());
-    bench!("Swap", get_swap());
+    bench!("Memory+Swap", get_memory_and_swap());
     bench!("Partitions", get_partitions_impl());
-    bench!("Display", get_display());
+    bench!("Display+Res", get_display_and_resolution());
     bench!("Battery", get_battery());
     bench!("Model", get_model());
     bench!("Motherboard", get_motherboard());
@@ -899,15 +895,14 @@ fn run_benchmarks(config: &Config) {
     bench!("Users", get_users_count());
     bench!("Entropy", get_entropy());
     bench!("Locale", get_locale());
-    bench!("Resolution", get_resolution());
     bench!("Failed units", get_failed_units());
-    bench!("GPU", get_gpu());
+    bench!("GPU+VRAM", get_gpu_combined());
     
     if !config.fast_mode {
         println!("\nExpensive operations (skipped in --fast mode):");
         bench!("CPU temp", get_cpu_temp());
         bench!("Public IP", get_public_ip());
-        let gpus = get_gpu();
+        let (gpus, _) = get_gpu_combined();
         bench!("GPU temps", get_gpu_temp_with_gpus(gpus.as_ref()));
     } else {
         println!("\n(Use without --fast to benchmark expensive operations)");
@@ -921,13 +916,16 @@ fn run_benchmarks(config: &Config) {
 // ============================================================================
 
 fn get_terminal_width() -> usize {
-    env::var("COLUMNS")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .or_else(|| {
-            run_cmd("tput", &["cols"]).and_then(|s| s.parse().ok())
-        })
-        .unwrap_or(80)
+    // $COLUMNS first (shell sets it, fastest)
+    if let Some(w) = env::var("COLUMNS").ok().and_then(|s| s.parse::<usize>().ok()) {
+        if w > 0 { return w; }
+    }
+    // ioctl TIOCGWINSZ — zero spawns
+    #[repr(C)] struct Winsize { rows: u16, cols: u16, _xp: u16, _yp: u16 }
+    extern "C" { fn ioctl(fd: i32, req: u64, ...) -> i32; }
+    let mut ws = Winsize { rows: 0, cols: 0, _xp: 0, _yp: 0 };
+    if unsafe { ioctl(2, 0x5413, &mut ws) } == 0 && ws.cols > 0 { return ws.cols as usize; }
+    80
 }
 
 fn visible_len(s: &str) -> usize {
@@ -1590,50 +1588,70 @@ fn get_cpu_temp() -> Option<String> {
     None
 }
 
-fn get_gpu() -> Option<Vec<String>> {
-    let mut gpus = Vec::with_capacity(2);
-    
-    if let Some(output) = run_cmd("lspci", &[]) {
-        for line in output.lines() {
-            let lower = line.to_lowercase();
-            
-            if lower.contains("bridge") || lower.contains("audio") || lower.contains("usb") {
-                continue;
-            }
-            
-            if !((lower.contains("vga") || lower.contains("3d") || 
+/// Single `lspci -v` call. Parses GPU names AND per-GPU VRAM in one pass.
+fn get_gpu_combined() -> (Option<Vec<String>>, Option<Vec<String>>) {
+    let output = match run_cmd("lspci", &["-v"]) {
+        Some(o) => o,
+        None    => return (None, None),
+    };
+
+    let mut gpus:  Vec<String> = Vec::with_capacity(2);
+    let mut vrams: Vec<String> = Vec::with_capacity(2);
+    let mut cur_vram: Option<String> = None;
+    let mut in_gpu = false;
+
+    for line in output.lines() {
+        let lower = line.to_lowercase();
+
+        // Top-level device line (no leading whitespace)
+        if !line.starts_with('\t') && !line.starts_with(' ') {
+            // flush previous GPU's vram
+            if in_gpu { vrams.push(cur_vram.take().unwrap_or_default()); }
+            in_gpu = false;
+
+            if lower.contains("bridge") || lower.contains("audio") || lower.contains("usb") { continue; }
+            if !((lower.contains("vga") || lower.contains("3d") ||
                   (lower.contains("display") && !lower.contains("audio"))) &&
-                 lower.contains("controller")) {
-                continue;
-            }
-            
-            if lower.contains("controller:") {
-                let desc_start = line.find("controller:").unwrap() + 11;
-                let mut desc = line[desc_start..].trim().to_string();
-                
-                if let Some(rev_pos) = desc.find(" (rev ") {
-                    desc = desc[..rev_pos].to_string();
-                }
-                
-                desc = desc
-                    .replace("Intel Corporation", "Intel")
-                    .replace("Advanced Micro Devices, Inc.", "AMD")
-                    .replace("[AMD/ATI]", "AMD")
-                    .replace("NVIDIA Corporation", "NVIDIA")
-                    .replace("Corporation", "")
-                    .trim()
-                    .to_string();
-                
-                if desc.len() > 10 && 
-                   !desc.to_lowercase().contains("bridge") &&
-                   !desc.starts_with("Device ") {
+                 lower.contains("controller")) { continue; }
+
+            if let Some(pos) = line.find("controller:") {
+                let mut desc = line[pos + 11..].trim().to_string();
+                if let Some(rp) = desc.find(" (rev ") { desc.truncate(rp); }
+                desc = desc.replace("Intel Corporation", "Intel")
+                           .replace("Advanced Micro Devices, Inc.", "AMD")
+                           .replace("[AMD/ATI]", "AMD")
+                           .replace("NVIDIA Corporation", "NVIDIA")
+                           .replace("Corporation", "");
+                let desc = desc.trim().to_string();
+                if desc.len() > 10 && !desc.to_lowercase().contains("bridge") && !desc.starts_with("Device ") {
                     gpus.push(desc);
+                    in_gpu = true;
+                    cur_vram = None;
+                }
+            }
+            continue;
+        }
+
+        // Detail line inside a GPU block — look for Memory size=
+        if in_gpu && line.contains("Memory at") && line.contains("size=") {
+            if let Some(p) = line.find("size=") {
+                let rest = &line[p + 5..];
+                if let Some(end) = rest.find(']') {
+                    let s = &rest[..end];
+                    let val = parse_human_size(s).unwrap_or(0.0);
+                    let cur = cur_vram.as_ref().and_then(|v| parse_human_size(v)).unwrap_or(0.0);
+                    if val > cur { cur_vram = Some(s.to_string()); }
                 }
             }
         }
     }
-    
-    if gpus.is_empty() { None } else { Some(gpus) }
+    if in_gpu { vrams.push(cur_vram.unwrap_or_default()); }
+
+    let vrams: Vec<String> = vrams.into_iter().filter(|s| !s.is_empty()).collect();
+    (
+        if gpus.is_empty()  { None } else { Some(gpus) },
+        if vrams.is_empty() { None } else { Some(vrams) },
+    )
 }
 
 fn get_gpu_temp_with_gpus(gpus: Option<&Vec<String>>) -> Option<Vec<Option<String>>> {
@@ -1706,89 +1724,72 @@ fn get_gpu_temp_with_gpus(gpus: Option<&Vec<String>>) -> Option<Vec<Option<Strin
     }
 }
 
-fn get_memory() -> Option<(f64, f64)> {
-    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-    let mut total = 0.0;
-    let mut available = 0.0;
-    
+/// Single read of /proc/meminfo. Returns (memory, swap).
+fn get_memory_and_swap() -> (Option<(f64, f64)>, Option<(f64, f64)>) {
+    let meminfo = match fs::read_to_string("/proc/meminfo") {
+        Ok(s) => s,
+        Err(_) => return (None, None),
+    };
+    let (mut mt, mut ma, mut st, mut sf) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
+    let (mut a, mut b, mut c, mut d) = (false, false, false, false);
     for line in meminfo.lines() {
-        if line.starts_with("MemTotal:") {
-            total = line.split_whitespace().nth(1)?.parse::<f64>().ok()? / KB_TO_GIB;
-        } else if line.starts_with("MemAvailable:") {
-            available = line.split_whitespace().nth(1)?.parse::<f64>().ok()? / KB_TO_GIB;
+        if a && b && c && d { break; } // all four found, stop scanning
+        if !a && line.starts_with("MemTotal:") {
+            if let Some(v) = line.split_whitespace().nth(1).and_then(|s| s.parse::<f64>().ok()) { mt = v / KB_TO_GIB; a = true; }
+        } else if !b && line.starts_with("MemAvailable:") {
+            if let Some(v) = line.split_whitespace().nth(1).and_then(|s| s.parse::<f64>().ok()) { ma = v / KB_TO_GIB; b = true; }
+        } else if !c && line.starts_with("SwapTotal:") {
+            if let Some(v) = line.split_whitespace().nth(1).and_then(|s| s.parse::<f64>().ok()) { st = v / KB_TO_GIB; c = true; }
+        } else if !d && line.starts_with("SwapFree:") {
+            if let Some(v) = line.split_whitespace().nth(1).and_then(|s| s.parse::<f64>().ok()) { sf = v / KB_TO_GIB; d = true; }
         }
     }
-    
-    if total > 0.0 {
-        Some((total - available, total))
-    } else {
-        None
-    }
+    let mem  = if mt  > 0.0 { Some((mt  - ma, mt))  } else { None };
+    let swap = if st > 0.0 { Some((st - sf, st)) } else { None };
+    (mem, swap)
 }
 
-fn get_swap() -> Option<(f64, f64)> {
-    let meminfo = fs::read_to_string("/proc/meminfo").ok()?;
-    let mut total = 0.0;
-    let mut free = 0.0;
-    for line in meminfo.lines() {
-        if line.starts_with("SwapTotal:") {
-            total = line.split_whitespace().nth(1)?.parse::<f64>().ok()? / KB_TO_GIB;
-        } else if line.starts_with("SwapFree:") {
-            free = line.split_whitespace().nth(1)?.parse::<f64>().ok()? / KB_TO_GIB;
+/// Returns (display, resolution). At most one subprocess on x11 (xrandr) or wayland (wlr-randr).
+fn get_display_and_resolution() -> (Option<String>, Option<String>) {
+    if let Ok(stype) = std::env::var("XDG_SESSION_TYPE") {
+        if stype == "wayland" {
+            let disp = match std::env::var("WAYLAND_DISPLAY") {
+                Ok(wd) => format!("Wayland ({})", wd),
+                Err(_) => "Wayland".to_string(),
+            };
+            let res = run_cmd("wlr-randr", &[]).and_then(|out|
+                out.lines().find(|l| l.contains(" px, ") && l.contains(" Hz")).map(|l| l.trim().to_string())
+            );
+            return (Some(disp), res);
         }
-    }
-    if total > 0.0 { Some((total - free, total)) } else { None }
-}
-
-fn get_gpu_vram() -> Option<Vec<String>> {
-    if let Some(output) = run_cmd("lspci", &["-v"]) {
-        let mut vrams: Vec<String> = Vec::with_capacity(2);
-        let mut current_gpu_vram: Option<String> = None;
-        
-        for line in output.lines() {
-            if line.contains("VGA compatible controller") || line.contains("Display controller") || line.contains("3D controller") {
-                if let Some(vram) = current_gpu_vram { vrams.push(vram); }
-                current_gpu_vram = None;
-            }
-            if line.contains("Memory at") && line.contains("size=") {
-                if let Some(pos) = line.find("size=") {
-                    let size_part = &line[pos+5..];
-                    if let Some(end) = size_part.find(']') {
-                        let size_str = size_part[..end].to_string();
-                        let size_val = parse_human_size(&size_str).unwrap_or(0.0);
-                        let current_val = current_gpu_vram.as_ref().and_then(|v| parse_human_size(v)).unwrap_or(0.0);
-                        if size_val > current_val {
-                            current_gpu_vram = Some(size_str);
+        if stype == "x11" {
+            // Single xrandr call serves both display and resolution
+            if let Some(out) = run_cmd("xrandr", &["--current"]) {
+                let mut res: Option<String> = None;
+                for line in out.lines() {
+                    if line.contains(" connected") && (line.contains(" primary") || !line.contains(" disconnected")) {
+                        for (i, p) in line.split_whitespace().enumerate() {
+                            if i > 0 && p.contains('x') && p.as_bytes().first().map_or(false, |b| b.is_ascii_digit()) {
+                                res = Some(p.to_string());
+                                break;
+                            }
                         }
+                        break;
                     }
                 }
+                let disp = match &res {
+                    Some(r) => format!("{} (X11)", r),
+                    None    => "X11".to_string(),
+                };
+                return (Some(disp), res);
             }
-        }
-        if let Some(vram) = current_gpu_vram { vrams.push(vram); }
-        if !vrams.is_empty() { return Some(vrams); }
-    }
-    None
-}
-
-fn get_resolution() -> Option<String> {
-    if let Some(out) = run_cmd("wlr-randr", &[]) {
-        for line in out.lines() {
-            if line.contains(" px, ") && line.contains(" Hz") { return Some(line.trim().to_string()); }
+            return (Some("X11".to_string()), None);
         }
     }
-    if let Some(out) = run_cmd("xrandr", &["--current"]) {
-        for line in out.lines() {
-            if line.contains(" connected") && (line.contains(" primary") || !line.contains(" disconnected")) {
-                let parts: Vec<&str> = line.split_whitespace().collect();
-                for (i, &p) in parts.iter().enumerate() {
-                    if p.contains('x') && p.chars().next().unwrap_or(' ').is_ascii_digit() && i > 0 {
-                        return Some(p.to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
+    // Fallback: env vars only, no resolution available
+    if std::env::var("DISPLAY").is_ok()          { return (Some("X11".to_string()),      None); }
+    if std::env::var("WAYLAND_DISPLAY").is_ok() { return (Some("Wayland".to_string()), None); }
+    (None, None)
 }
 
 fn get_entropy() -> Option<String> {
@@ -1798,26 +1799,17 @@ fn get_entropy() -> Option<String> {
 }
 
 fn get_users_count() -> Option<usize> {
-    if let Some(out) = run_cmd("who", &[]) {
-        let count = out.lines().filter(|l| !l.trim().is_empty()).count();
+    // Count entries with real login shells — zero subprocess spawns.
+    if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
+        let count = passwd.lines().filter(|line| {
+            if line.is_empty() || line.starts_with('#') { return false; }
+            match line.rsplit(':').next() {
+                Some(shell) => shell != "/sbin/nologin" && shell != "/bin/false" && shell != "/usr/sbin/nologin",
+                None => false,
+            }
+        }).count();
         if count > 0 { return Some(count); }
     }
-    
-    if let Some(out) = run_cmd("w", &["-h"]) {
-        let count = out.lines().filter(|l| !l.trim().is_empty()).count();
-        if count > 0 { return Some(count); }
-    }
-
-    if let Some(out) = run_cmd("users", &[]) {
-        let count = out.split_whitespace().count();
-        if count > 0 { return Some(count); }
-    }
-
-    if let Some(out) = run_cmd("loginctl", &["list-users", "--no-legend"]) {
-        let count = out.lines().filter(|l| !l.trim().is_empty()).count();
-        if count > 0 { return Some(count); }
-    }
-
     Some(1)
 }
 
@@ -1827,29 +1819,33 @@ fn get_failed_units() -> Option<usize> {
 }
 
 fn get_partitions_impl() -> Option<Vec<(String, String, f64, f64)>> {
-    if let Some(output) = run_cmd("df", &["-hT", "/"]) {
-        for line in output.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            if fields.len() >= 6 {
-                let source = fields[0];
-                let fstype = fields[1];
-                
-                if source == "Filesystem" || source == "none" || source == "tmpfs" {
-                    continue;
-                }
-                
-                if let (Some(total), Some(used)) = (
-                    parse_human_size(fields[2]),
-                    parse_human_size(fields[3])
-                ) {
-                    let dev_name = source.rsplit('/').next().unwrap_or(source);
-                    let display = format!("{} - {}", dev_name, fstype);
-                    return Some(vec![(display, "/".to_string(), used, total)]);
-                }
-            }
-        }
+    // Find device + fstype for "/" from /proc/mounts (zero spawns)
+    let mounts = fs::read_to_string("/proc/mounts").ok()?;
+    let mut dev = "root";
+    let mut fst = "unknown";
+    for line in mounts.lines() {
+        let mut it = line.splitn(4, ' ');
+        let d = it.next().unwrap_or("");
+        let mp = it.next().unwrap_or("");
+        let f  = it.next().unwrap_or("");
+        if mp == "/" { dev = d; fst = f; break; }
     }
-    None
+    let dev_short = dev.rsplit('/').next().unwrap_or(dev);
+
+    // statfs syscall — no external binary needed
+    #[repr(C)]
+    struct Statfs { f_type: i64, f_bsize: i64, f_blocks: u64, f_bfree: u64, f_bavail: u64,
+                    f_files: u64, f_ffree: u64, f_fsid: [i64; 2], f_flag: i64, f_namelen: i64, _pad: [i64; 4] }
+    extern "C" { fn statfs(path: *const u8, buf: *mut Statfs) -> i32; }
+    let mut s = Statfs { f_type:0, f_bsize:0, f_blocks:0, f_bfree:0, f_bavail:0,
+                         f_files:0, f_ffree:0, f_fsid:[0;2], f_flag:0, f_namelen:0, _pad:[0;4] };
+    if unsafe { statfs(b"/\0".as_ptr(), &mut s) } != 0 { return None; }
+
+    let bs    = s.f_bsize as f64;
+    let total = s.f_blocks as f64 * bs / (1024.0 * 1024.0 * 1024.0);
+    let avail = s.f_bavail as f64 * bs / (1024.0 * 1024.0 * 1024.0);
+    if total <= 0.0 { return None; }
+    Some(vec![(format!("{} - {}", dev_short, fst), "/".to_string(), total - avail, total)])
 }
 
 fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
@@ -1907,32 +1903,43 @@ struct ThemeInfo {
 
 fn get_theme_info() -> ThemeInfo {
     let mut info = ThemeInfo { theme: None, icons: None, font: None };
-    
-    if let Some(theme) = run_cmd("gsettings", &["get", "org.gnome.desktop.interface", "gtk-theme"]) {
-        info.theme = Some(theme.trim_matches('\'').to_string());
-    }
-    if let Some(icons) = run_cmd("gsettings", &["get", "org.gnome.desktop.interface", "icon-theme"]) {
-        info.icons = Some(icons.trim_matches('\'').to_string());
-    }
-    if let Some(font) = run_cmd("gsettings", &["get", "org.gnome.desktop.interface", "font-name"]) {
-        info.font = Some(font.trim_matches('\'').to_string());
-    }
 
-    if info.theme.is_none() || info.font.is_none() {
-        if let Ok(home) = env::var("HOME") {
-            let kdeglobals = format!("{}/.config/kdeglobals", home);
-            if let Ok(content) = fs::read_to_string(kdeglobals) {
-                for line in content.lines() {
-                    if line.starts_with("widgetStyle=") && info.theme.is_none() {
-                        info.theme = Some(line.split('=').nth(1).unwrap_or("").to_string());
-                    } else if line.starts_with("font=") && info.font.is_none() {
-                        info.font = Some(line.split('=').nth(1).unwrap_or("").split(',').next().unwrap_or("").to_string());
-                    }
+    // KDE path first — pure file reads, zero spawns.
+    if let Ok(home) = env::var("HOME") {
+        if let Ok(content) = fs::read_to_string(format!("{}/.config/kdeglobals", home)) {
+            let mut in_icons = false;
+            for line in content.lines() {
+                if line == "[Icons]"  { in_icons = true;  continue; }
+                if line.starts_with('[') { in_icons = false; }
+                if in_icons && line.starts_with("theme=") && info.icons.is_none() {
+                    info.icons = Some(line.split('=').nth(1).unwrap_or("").to_string());
+                }
+                if line.starts_with("widgetStyle=") && info.theme.is_none() {
+                    info.theme = Some(line.split('=').nth(1).unwrap_or("").to_string());
+                }
+                if line.starts_with("font=") && info.font.is_none() {
+                    info.font = Some(line.split('=').nth(1).unwrap_or("").split(',').next().unwrap_or("").to_string());
                 }
             }
         }
     }
-    
+
+    // Only spawn gsettings for values still missing (GNOME fallback).
+    if info.theme.is_none() {
+        if let Some(v) = run_cmd("gsettings", &["get", "org.gnome.desktop.interface", "gtk-theme"]) {
+            let v = v.trim_matches('\''); if !v.is_empty() { info.theme = Some(v.to_string()); }
+        }
+    }
+    if info.icons.is_none() {
+        if let Some(v) = run_cmd("gsettings", &["get", "org.gnome.desktop.interface", "icon-theme"]) {
+            let v = v.trim_matches('\''); if !v.is_empty() { info.icons = Some(v.to_string()); }
+        }
+    }
+    if info.font.is_none() {
+        if let Some(v) = run_cmd("gsettings", &["get", "org.gnome.desktop.interface", "font-name"]) {
+            let v = v.trim_matches('\''); if !v.is_empty() { info.font = Some(v.to_string()); }
+        }
+    }
     info
 }
 
@@ -1987,6 +1994,11 @@ fn get_battery() -> Option<(u8, String)> {
 }
 
 fn get_network_final(net_start: Option<String>, delta: f64, should_ping: bool) -> Option<Vec<NetworkInfo>> {
+    let ip_out = run_cmd("ip", &["-o", "addr", "show"]);
+    get_network_final_with_ip(net_start, delta, should_ping, ip_out)
+}
+
+fn get_network_final_with_ip(net_start: Option<String>, delta: f64, should_ping: bool, ip_out: Option<String>) -> Option<Vec<NetworkInfo>> {
     let dev1 = net_start?;
     let dev2 = fs::read_to_string("/proc/net/dev").ok()?;
     
@@ -1997,7 +2009,7 @@ fn get_network_final(net_start: Option<String>, delta: f64, should_ping: bool) -
     }
 
     let mut ip_map = HashMap::new();
-    if let Some(output) = run_cmd("ip", &["-o", "addr", "show"]) {
+    if let Some(output) = ip_out {
         for line in output.lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
             if parts.len() < 4 { continue; }
@@ -2064,35 +2076,6 @@ fn get_network_final(net_start: Option<String>, delta: f64, should_ping: bool) -
 
     if networks.is_empty() { None } else { Some(networks) }
 }
-
-fn get_display() -> Option<String> {
-    if let Ok(session_type) = std::env::var("XDG_SESSION_TYPE") {
-        if session_type == "wayland" {
-            if let Ok(wayland_display) = std::env::var("WAYLAND_DISPLAY") {
-                return Some(format!("Wayland ({})", wayland_display));
-            }
-            return Some("Wayland".to_string());
-        } else if session_type == "x11" {
-            if let Some(output) = run_cmd("sh", &["-c", "xrandr --current 2>/dev/null | grep '*'"]) {
-                if let Some(res) = output.split_whitespace()
-                    .find(|w| w.contains('x') && w.chars().next().unwrap_or('a').is_numeric())
-                {
-                    return Some(format!("{} (X11)", res));
-                }
-            }
-            return Some("X11".to_string());
-        }
-    }
-    
-    if std::env::var("DISPLAY").is_ok() {
-        Some("X11".to_string())
-    } else if std::env::var("WAYLAND_DISPLAY").is_ok() {
-        Some("Wayland".to_string())
-    } else {
-        None
-    }
-}
-
 
 // ============================================================================
 // ASCII LOGOS
