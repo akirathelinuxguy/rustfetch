@@ -6,7 +6,74 @@ use std::{
     thread,
     collections::HashMap,
     time::{SystemTime, UNIX_EPOCH},
+    io::Write,
 };
+
+// ============================================================================
+// LOGGING CONFIGURATION
+// ============================================================================
+
+const LOG_FILE: &str = "/tmp/rustfetch_log";
+const LOG_ENABLED: bool = true;
+
+/// Logs a message to the rustfetch log file with timestamp and severity level.
+/// This function provides detailed, human-readable logging for debugging and monitoring.
+fn log_message(level: &str, category: &str, message: &str) {
+    if !LOG_ENABLED {
+        return;
+    }
+    
+    let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(duration) => {
+            let secs = duration.as_secs();
+            let datetime = format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                1970 + (secs / 31536000),
+                ((secs / 2592000) % 12) + 1,
+                ((secs / 86400) % 30) + 1,
+                (secs / 3600) % 24,
+                (secs / 60) % 60,
+                secs % 60
+            );
+            datetime
+        }
+        Err(_) => "UNKNOWN_TIME".to_string(),
+    };
+    
+    let log_entry = format!(
+        "[{}] [{:7}] [{}] {}\n",
+        timestamp, level, category, message
+    );
+    
+    // Try to append to log file, create if it doesn't exist
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(LOG_FILE)
+    {
+        let _ = file.write_all(log_entry.as_bytes());
+    }
+}
+
+/// Logs an informational message - routine operations and status updates
+fn log_info(category: &str, message: &str) {
+    log_message("INFO", category, message);
+}
+
+/// Logs a warning message - unexpected but non-critical issues
+fn log_warn(category: &str, message: &str) {
+    log_message("WARNING", category, message);
+}
+
+/// Logs an error message - critical failures that prevent normal operation
+fn log_error(category: &str, message: &str) {
+    log_message("ERROR", category, message);
+}
+
+/// Logs a debug message - detailed information for troubleshooting
+fn log_debug(category: &str, message: &str) {
+    log_message("DEBUG", category, message);
+}
 
 // ============================================================================
 // VERSION INFO
@@ -723,104 +790,331 @@ fn save_cache(info: &Info) {
 // ============================================================================
 
 fn main() {
+    log_info("STARTUP", "Rustfetch starting up");
+    log_debug("STARTUP", &format!("Version: {}", VERSION));
+    
     let config = match parse_args() {
-        Some(cfg) => cfg,
-        None => return,
+        Some(cfg) => {
+            log_info("CONFIG", "Command line arguments parsed successfully");
+            log_debug("CONFIG", &format!("Color enabled: {}, Theme: {}, JSON output: {}", 
+                cfg.use_color, cfg.color_scheme, cfg.json_output));
+            log_debug("CONFIG", &format!("Cache enabled: {}, TTL: {}s, Fast mode: {}", 
+                cfg.cache_enabled, cfg.cache_ttl, cfg.fast_mode));
+            cfg
+        },
+        None => {
+            log_info("STARTUP", "Help displayed or invalid arguments, exiting normally");
+            return;
+        }
     };
     
     if config.benchmark {
+        log_info("BENCHMARK", "Running in benchmark mode");
         run_benchmarks(&config);
+        log_info("BENCHMARK", "Benchmark completed");
         return;
     }
     
+    log_info("EXECUTION", "Beginning system information collection");
     let start_time = std::time::Instant::now();
     // Snapshot /proc/net/dev as early as possible for bandwidth delta
-    let net_start = if config.show_network { read_file_trim("/proc/net/dev") } else { None };
+    let net_start = if config.show_network { 
+        log_debug("NETWORK", "Reading initial network statistics from /proc/net/dev");
+        match read_file_trim("/proc/net/dev") {
+            Some(data) => {
+                log_debug("NETWORK", "Successfully captured initial network state");
+                Some(data)
+            },
+            None => {
+                log_warn("NETWORK", "Failed to read /proc/net/dev for network statistics");
+                None
+            }
+        }
+    } else { 
+        log_debug("NETWORK", "Network display disabled, skipping network stats");
+        None 
+    };
 
+    log_info("THREADS", "Spawning 5 parallel threads for system information gathering");
     let info = thread::scope(|s| {
         // ── Thread 1: pure env + file reads. ZERO spawns. ──
+        log_debug("THREAD1", "Starting Thread 1: Environment and file-based info (user, hostname, OS, kernel, etc.)");
         let cfg1 = config.clone();
         let t1 = s.spawn(move || {
+            log_debug("THREAD1", "Collecting user information");
             let user        = get_user();
+            if user.is_some() { log_debug("THREAD1", "User information collected successfully"); }
+            else { log_warn("THREAD1", "Failed to determine current user"); }
+            
+            log_debug("THREAD1", "Collecting hostname");
             let hostname    = get_hostname();
+            if hostname.is_some() { log_debug("THREAD1", "Hostname collected successfully"); }
+            else { log_warn("THREAD1", "Failed to determine hostname"); }
+            
+            log_debug("THREAD1", "Detecting operating system");
             let os          = get_os();
+            if os.is_some() { log_debug("THREAD1", &format!("OS detected: {:?}", os)); }
+            else { log_warn("THREAD1", "Failed to detect operating system"); }
+            
+            log_debug("THREAD1", "Reading kernel version");
             let kernel      = get_kernel();
-            let uptime      = if cfg1.show_uptime    { get_uptime() }    else { None };
-            let shell       = if cfg1.show_shell     { get_shell() }     else { None };
-            let de          = if cfg1.show_de        { get_de() }        else { None };
-            let init        = if cfg1.show_init      { get_init() }      else { None };
-            let terminal    = if cfg1.show_terminal  { get_terminal() }  else { None };
-            let locale      = if cfg1.show_locale    { get_locale() }    else { None };
-            let model       = if cfg1.show_model     { get_model() }     else { None };
-            let motherboard = if cfg1.show_motherboard { get_motherboard() } else { None };
-            let bios        = if cfg1.show_bios      { get_bios() }      else { None };
+            if kernel.is_some() { log_debug("THREAD1", &format!("Kernel: {:?}", kernel)); }
+            else { log_warn("THREAD1", "Failed to read kernel version"); }
+            
+            let uptime      = if cfg1.show_uptime    { 
+                log_debug("THREAD1", "Calculating system uptime");
+                let up = get_uptime();
+                if up.is_some() { log_debug("THREAD1", "Uptime calculated successfully"); }
+                else { log_warn("THREAD1", "Failed to calculate uptime"); }
+                up
+            } else { None };
+            
+            let shell       = if cfg1.show_shell     { 
+                log_debug("THREAD1", "Detecting shell");
+                let sh = get_shell();
+                if sh.is_some() { log_debug("THREAD1", &format!("Shell detected: {:?}", sh)); }
+                else { log_warn("THREAD1", "Failed to detect shell"); }
+                sh
+            } else { None };
+            
+            let de          = if cfg1.show_de        { 
+                log_debug("THREAD1", "Detecting desktop environment");
+                let desktop = get_de();
+                if desktop.is_some() { log_debug("THREAD1", &format!("DE detected: {:?}", desktop)); }
+                else { log_debug("THREAD1", "No desktop environment detected (normal for servers/minimal installs)"); }
+                desktop
+            } else { None };
+            
+            let init        = if cfg1.show_init      { 
+                log_debug("THREAD1", "Detecting init system");
+                get_init()
+            } else { None };
+            
+            let terminal    = if cfg1.show_terminal  { 
+                log_debug("THREAD1", "Detecting terminal emulator");
+                get_terminal()
+            } else { None };
+            
+            let locale      = if cfg1.show_locale    { 
+                log_debug("THREAD1", "Reading locale settings");
+                get_locale()
+            } else { None };
+            
+            let model       = if cfg1.show_model     { 
+                log_debug("THREAD1", "Reading hardware model information");
+                get_model()
+            } else { None };
+            
+            let motherboard = if cfg1.show_motherboard { 
+                log_debug("THREAD1", "Reading motherboard information");
+                get_motherboard()
+            } else { None };
+            
+            let bios        = if cfg1.show_bios      { 
+                log_debug("THREAD1", "Reading BIOS version");
+                get_bios()
+            } else { None };
+            
+            log_debug("THREAD1", "Thread 1 completed successfully");
             (user, hostname, os, kernel, uptime, shell, de, init, terminal, locale, model, motherboard, bios)
         });
 
         // ── Thread 2: cpu, mem+swap (1 read), battery, processes, users, entropy ──
+        log_debug("THREAD2", "Starting Thread 2: CPU, memory, battery, and process info");
         let cfg2 = config.clone();
         let t2 = s.spawn(move || {
+            log_debug("THREAD2", "Collecting CPU information");
             let cpu_info  = get_cpu_info_combined();
-            let cpu_temp  = if cfg2.show_cpu_temp && !cfg2.fast_mode { get_cpu_temp() } else { None };
-            let (memory, swap) = if cfg2.show_memory || cfg2.show_swap { get_memory_and_swap() } else { (None, None) };
-            let battery   = if cfg2.show_battery   { get_battery() }     else { None };
-            let processes = if cfg2.show_processes { get_processes() }   else { None };
-            let users     = if cfg2.show_users     { get_users_count() } else { None };
-            let entropy   = if cfg2.show_entropy   { get_entropy() }     else { None };
+            if cpu_info.name.is_some() { log_debug("THREAD2", &format!("CPU detected: {:?}", cpu_info.name)); }
+            else { log_warn("THREAD2", "Failed to detect CPU name"); }
+            
+            let cpu_temp  = if cfg2.show_cpu_temp && !cfg2.fast_mode { 
+                log_debug("THREAD2", "Reading CPU temperature");
+                let temp = get_cpu_temp();
+                if temp.is_some() { log_debug("THREAD2", &format!("CPU temp: {:?}°C", temp)); }
+                else { log_warn("THREAD2", "CPU temperature not available (normal for some systems/VMs)"); }
+                temp
+            } else { 
+                if cfg2.fast_mode { log_debug("THREAD2", "Skipping CPU temperature (fast mode enabled)"); }
+                None 
+            };
+            
+            log_debug("THREAD2", "Reading memory and swap information");
+            let (memory, swap) = if cfg2.show_memory || cfg2.show_swap { 
+                let mem_swap = get_memory_and_swap();
+                if mem_swap.0.is_some() { log_debug("THREAD2", "Memory info collected successfully"); }
+                else { log_warn("THREAD2", "Failed to read memory information"); }
+                mem_swap
+            } else { (None, None) };
+            
+            let battery   = if cfg2.show_battery   { 
+                log_debug("THREAD2", "Checking for battery");
+                let bat = get_battery();
+                if bat.is_some() { log_debug("THREAD2", &format!("Battery found: {:?}", bat)); }
+                else { log_debug("THREAD2", "No battery detected (normal for desktops)"); }
+                bat
+            } else { None };
+            
+            let processes = if cfg2.show_processes { 
+                log_debug("THREAD2", "Counting running processes");
+                get_processes()
+            } else { None };
+            
+            let users     = if cfg2.show_users     { 
+                log_debug("THREAD2", "Counting logged-in users");
+                get_users_count()
+            } else { None };
+            
+            let entropy   = if cfg2.show_entropy   { 
+                log_debug("THREAD2", "Reading system entropy");
+                get_entropy()
+            } else { None };
+            
+            log_debug("THREAD2", "Thread 2 completed successfully");
             (cpu_info, cpu_temp, memory, swap, battery, processes, users, entropy)
         });
 
         // ── Thread 3: single lspci -v → gpu names + vram, then gpu temps ──
+        log_debug("THREAD3", "Starting Thread 3: GPU detection and information");
         let cfg3 = config.clone();
         let t3 = s.spawn(move || {
             let (gpus, gpu_vram) = if cfg3.show_gpu || cfg3.show_gpu_vram {
-                get_gpu_combined()
+                log_debug("THREAD3", "Running lspci to detect GPU(s)");
+                let gpu_info = get_gpu_combined();
+                if gpu_info.0.is_some() { log_debug("THREAD3", &format!("GPU(s) detected: {:?}", gpu_info.0)); }
+                else { log_warn("THREAD3", "No GPU detected or lspci unavailable"); }
+                gpu_info
             } else { (None, None) };
+            
             let gpu_temps = if cfg3.show_gpu && !cfg3.fast_mode {
-                get_gpu_temp_with_gpus(gpus.as_ref())
-            } else { None };
+                log_debug("THREAD3", "Reading GPU temperature");
+                let temps = get_gpu_temp_with_gpus(gpus.as_ref());
+                if temps.is_some() { log_debug("THREAD3", &format!("GPU temps: {:?}°C", temps)); }
+                else { log_debug("THREAD3", "GPU temperature not available (normal for some GPUs/drivers)"); }
+                temps
+            } else { 
+                if cfg3.fast_mode { log_debug("THREAD3", "Skipping GPU temperature (fast mode enabled)"); }
+                None 
+            };
+            
+            log_debug("THREAD3", "Thread 3 completed successfully");
             (gpus, gpu_temps, gpu_vram)
         });
 
         // ── Thread 4: packages, partitions (statfs), bootloader, wm, failed, theme ──
+        log_debug("THREAD4", "Starting Thread 4: Package counts, partitions, bootloader, WM, and theme");
         let cfg4 = config.clone();
         let t4 = s.spawn(move || {
-            let packages     = if cfg4.show_packages     { get_packages() }     else { None };
-            let partitions   = if cfg4.show_partitions   { get_partitions_impl() } else { None };
-            let boot_time    = if cfg4.show_boot_time    { get_boot_time() }    else { None };
-            let bootloader   = if cfg4.show_bootloader   { get_bootloader() }   else { None };
-            let wm           = if cfg4.show_wm           { get_wm() }           else { None };
-            let public_ip    = if cfg4.show_public_ip && !cfg4.fast_mode { get_public_ip() } else { None };
-            let failed_units = if cfg4.show_failed_units { get_failed_units() } else { None };
+            let packages     = if cfg4.show_packages     { 
+                log_debug("THREAD4", "Counting installed packages");
+                let pkgs = get_packages();
+                if pkgs.is_some() { log_debug("THREAD4", &format!("Packages counted: {:?}", pkgs)); }
+                else { log_warn("THREAD4", "Failed to count packages"); }
+                pkgs
+            } else { None };
+            
+            let partitions   = if cfg4.show_partitions   { 
+                log_debug("THREAD4", "Reading partition information");
+                get_partitions_impl()
+            } else { None };
+            
+            let boot_time    = if cfg4.show_boot_time    { 
+                log_debug("THREAD4", "Calculating boot time");
+                get_boot_time()
+            } else { None };
+            
+            let bootloader   = if cfg4.show_bootloader   { 
+                log_debug("THREAD4", "Detecting bootloader");
+                get_bootloader()
+            } else { None };
+            
+            let wm           = if cfg4.show_wm           { 
+                log_debug("THREAD4", "Detecting window manager");
+                let window_mgr = get_wm();
+                if window_mgr.is_some() { log_debug("THREAD4", &format!("WM detected: {:?}", window_mgr)); }
+                else { log_debug("THREAD4", "No window manager detected (normal for servers)"); }
+                window_mgr
+            } else { None };
+            
+            let public_ip    = if cfg4.show_public_ip && !cfg4.fast_mode { 
+                log_debug("THREAD4", "Fetching public IP address (may take a moment)");
+                let ip = get_public_ip();
+                if ip.is_some() { log_debug("THREAD4", "Public IP retrieved"); }
+                else { log_warn("THREAD4", "Failed to retrieve public IP (check internet connection)"); }
+                ip
+            } else { 
+                if cfg4.fast_mode { log_debug("THREAD4", "Skipping public IP (fast mode enabled)"); }
+                None 
+            };
+            
+            let failed_units = if cfg4.show_failed_units { 
+                log_debug("THREAD4", "Checking for failed systemd units");
+                get_failed_units()
+            } else { None };
+            
             let theme_info   = if cfg4.show_theme || cfg4.show_icons || cfg4.show_font {
+                log_debug("THREAD4", "Reading desktop theme information");
                 get_theme_info()
             } else { ThemeInfo { theme: None, icons: None, font: None } };
+            
+            log_debug("THREAD4", "Thread 4 completed successfully");
             (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units, theme_info)
         });
 
         // ── Thread 5: display+resolution (1 xrandr) + prefetch ip for network ──
+        log_debug("THREAD5", "Starting Thread 5: Display info and network IP prefetch");
         let cfg5 = config.clone();
         let t5 = s.spawn(move || {
             let (display, resolution) = if cfg5.show_display || cfg5.show_resolution {
-                get_display_and_resolution()
+                log_debug("THREAD5", "Running xrandr to detect display and resolution");
+                let disp_info = get_display_and_resolution();
+                if disp_info.0.is_some() || disp_info.1.is_some() { 
+                    log_debug("THREAD5", "Display information collected"); 
+                } else { 
+                    log_debug("THREAD5", "Display info not available (normal for headless/server systems)"); 
+                }
+                disp_info
             } else { (None, None) };
+            
             // Prefetch ip output so network assembly after join has zero extra latency
-            let ip_out = if cfg5.show_network { run_cmd("ip", &["-o", "addr", "show"]) } else { None };
+            let ip_out = if cfg5.show_network { 
+                log_debug("THREAD5", "Pre-fetching network IP addresses");
+                run_cmd("ip", &["-o", "addr", "show"])
+            } else { None };
+            
+            log_debug("THREAD5", "Thread 5 completed successfully");
             (display, resolution, ip_out)
         });
 
         // ── join ──
+        log_debug("THREADS", "Waiting for all threads to complete");
         let (user, hostname, os, kernel, uptime, shell, de, init, terminal, locale, model, motherboard, bios) = t1.join().unwrap();
+        log_debug("THREADS", "Thread 1 joined");
+        
         let (cpu_info, cpu_temp, memory, swap, battery, processes, users, entropy) = t2.join().unwrap();
+        log_debug("THREADS", "Thread 2 joined");
+        
         let (gpu, gpu_temps, gpu_vram) = t3.join().unwrap();
+        log_debug("THREADS", "Thread 3 joined");
+        
         let (packages, partitions, boot_time, bootloader, wm, public_ip, failed_units, theme_info) = t4.join().unwrap();
+        log_debug("THREADS", "Thread 4 joined");
+        
         let (display, resolution, ip_out) = t5.join().unwrap();
+        log_debug("THREADS", "Thread 5 joined - all threads completed");
 
         // Network: uses pre-fetched ip output — no spawn on critical path
+        log_debug("NETWORK", "Finalizing network statistics");
         let network = if config.show_network {
             let delta = start_time.elapsed().as_secs_f64();
-            get_network_final_with_ip(net_start, delta, config.show_network_ping, ip_out)
+            log_debug("NETWORK", &format!("Network delta time: {:.3}s", delta));
+            let net = get_network_final_with_ip(net_start, delta, config.show_network_ping, ip_out);
+            if net.is_some() { log_debug("NETWORK", "Network information collected successfully"); }
+            else { log_warn("NETWORK", "Failed to collect network information"); }
+            net
         } else { None };
+
+        log_info("COLLECTION", "All system information collected successfully");
 
         Info {
             user, hostname, os, kernel, uptime, shell, de, wm, init, terminal,
@@ -840,17 +1134,33 @@ fn main() {
         }
     });
     
+    let elapsed = start_time.elapsed();
+    log_info("PERFORMANCE", &format!("Total execution time: {:.3}s", elapsed.as_secs_f64()));
+    
     if config.json_output {
+        log_debug("OUTPUT", "Rendering output in JSON format");
         println!("{}", info.to_json());
+        log_info("OUTPUT", "JSON output rendered successfully");
     } else {
+        log_debug("OUTPUT", "Rendering output in standard format");
         render_output(&info, &config);
+        log_info("OUTPUT", "Standard output rendered successfully");
     }
     
     // Fire-and-forget cache write — doesn't block exit
     if config.cache_enabled {
+        log_debug("CACHE", "Spawning background thread to save cache");
         let info_c = info.clone();
-        std::thread::spawn(move || save_cache(&info_c));
+        std::thread::spawn(move || {
+            log_debug("CACHE", "Writing cache to disk");
+            save_cache(&info_c);
+            log_debug("CACHE", "Cache saved successfully");
+        });
+    } else {
+        log_debug("CACHE", "Cache disabled, skipping save");
     }
+    
+    log_info("SHUTDOWN", "Rustfetch completed successfully");
 }
 
 // ============================================================================
@@ -1310,18 +1620,166 @@ fn format_unix_timestamp(timestamp: i64) -> String {
 }
 
 fn get_bootloader() -> Option<String> {
-    let systemd_paths = [
-        "/boot/efi/loader/loader.conf",
-        "/boot/loader/loader.conf",
-        "/efi/loader/loader.conf",
-    ];
+    log_debug("BOOTLOADER", "Starting comprehensive bootloader detection");
     
-    for path in &systemd_paths {
-        if Path::new(path).exists() {
+    // ============================================================================
+    // METHOD 1: Check EFI Boot Manager entries (Most Reliable for UEFI systems)
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking EFI boot manager entries");
+    if let Some(output) = run_cmd("efibootmgr", &["-v"]) {
+        let lower = output.to_lowercase();
+        let lines: Vec<&str> = output.lines().collect();
+        
+        // Find the current boot entry (marked with *)
+        let current_boot = lines.iter()
+            .find(|line| line.contains('*'))
+            .or_else(|| {
+                // If no * found, look for BootCurrent
+                if let Some(current_line) = lines.iter().find(|l| l.contains("BootCurrent")) {
+                    let boot_num = current_line.split(':').nth(1)?.trim().trim_start_matches('0');
+                    lines.iter().find(|l| l.starts_with(&format!("Boot{}", boot_num)))
+                } else {
+                    lines.first()
+                }
+            })
+            .map(|s| s.to_lowercase());
+        
+        if let Some(current) = current_boot {
+            log_debug("BOOTLOADER", &format!("Current EFI boot entry: {}", current));
+            
+            // Check current boot entry first (highest priority)
+            if current.contains("grub") {
+                // Determine GRUB variant from the path
+                if current.contains("grub2") {
+                    log_info("BOOTLOADER", "Detected GRUB 2 from current EFI boot entry");
+                    return Some("GRUB 2".to_string());
+                } else {
+                    log_info("BOOTLOADER", "Detected GRUB from current EFI boot entry");
+                    return Some("GRUB".to_string());
+                }
+            } else if current.contains("systemd") || current.contains("gummiboot") {
+                log_info("BOOTLOADER", "Detected systemd-boot from current EFI boot entry");
+                return Some("systemd-boot".to_string());
+            } else if current.contains("refind") {
+                log_info("BOOTLOADER", "Detected rEFInd from current EFI boot entry");
+                return Some("rEFInd".to_string());
+            } else if current.contains("limine") {
+                log_info("BOOTLOADER", "Detected Limine from current EFI boot entry");
+                return Some("Limine".to_string());
+            } else if current.contains("clover") {
+                log_info("BOOTLOADER", "Detected Clover from current EFI boot entry");
+                return Some("Clover".to_string());
+            } else if current.contains("opencore") {
+                log_info("BOOTLOADER", "Detected OpenCore from current EFI boot entry");
+                return Some("OpenCore".to_string());
+            } else if current.contains("bootmgfw") || current.contains("windows") {
+                // Might be dual boot, continue checking
+                log_debug("BOOTLOADER", "Found Windows Boot Manager entry, continuing Linux bootloader detection");
+            } else if current.contains("uefi") || current.contains("shell") {
+                log_debug("BOOTLOADER", "Found UEFI Shell entry, continuing detection");
+            }
+        }
+        
+        // Fallback: Check all entries if current didn't match
+        if lower.contains("grub2") {
+            log_info("BOOTLOADER", "Detected GRUB 2 from EFI entries");
+            return Some("GRUB 2".to_string());
+        } else if lower.contains("grub") {
+            log_info("BOOTLOADER", "Detected GRUB from EFI entries");
+            return Some("GRUB".to_string());
+        } else if lower.contains("systemd") || lower.contains("gummiboot") {
+            log_info("BOOTLOADER", "Detected systemd-boot from EFI entries");
+            return Some("systemd-boot".to_string());
+        } else if lower.contains("refind") {
+            log_info("BOOTLOADER", "Detected rEFInd from EFI entries");
+            return Some("rEFInd".to_string());
+        } else if lower.contains("limine") {
+            log_info("BOOTLOADER", "Detected Limine from EFI entries");
+            return Some("Limine".to_string());
+        } else if lower.contains("clover") {
+            log_info("BOOTLOADER", "Detected Clover from EFI entries");
+            return Some("Clover".to_string());
+        } else if lower.contains("opencore") {
+            log_info("BOOTLOADER", "Detected OpenCore from EFI entries");
+            return Some("OpenCore".to_string());
+        }
+    }
+    
+    // ============================================================================
+    // METHOD 2: Check bootctl for systemd-boot (before file checks)
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking bootctl status for systemd-boot");
+    if let Some(output) = run_cmd("bootctl", &["status"]) {
+        let lower = output.to_lowercase();
+        if lower.contains("systemd-boot") {
+            // Try to extract version
+            for line in output.lines() {
+                if line.to_lowercase().contains("systemd-boot") && line.contains("(") {
+                    log_info("BOOTLOADER", &format!("Detected systemd-boot via bootctl: {}", line.trim()));
+                    return Some("systemd-boot".to_string());
+                }
+            }
+            log_info("BOOTLOADER", "Detected systemd-boot via bootctl");
             return Some("systemd-boot".to_string());
         }
     }
     
+    // ============================================================================
+    // METHOD 3: Check for systemd-boot (gummiboot successor)
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for systemd-boot configuration files");
+    let systemd_paths = [
+        "/boot/efi/loader/loader.conf",
+        "/boot/loader/loader.conf",
+        "/efi/loader/loader.conf",
+        "/boot/efi/loader/entries",
+        "/boot/loader/entries",
+        "/efi/loader/entries",
+        "/boot/efi/EFI/systemd/systemd-bootx64.efi",
+        "/boot/efi/EFI/BOOT/BOOTX64.EFI",  // Check if it's systemd-boot
+    ];
+    
+    for path in &systemd_paths {
+        if Path::new(path).exists() {
+            // For BOOTX64.EFI, verify it's systemd-boot
+            if path.contains("BOOTX64.EFI") {
+                if let Ok(content) = fs::read(path) {
+                    let content_str = String::from_utf8_lossy(&content[..content.len().min(8192)]);
+                    if content_str.contains("systemd-boot") || content_str.contains("gummiboot") {
+                        log_info("BOOTLOADER", "Detected systemd-boot via BOOTX64.EFI signature");
+                        return Some("systemd-boot".to_string());
+                    }
+                }
+            } else {
+                log_info("BOOTLOADER", &format!("Detected systemd-boot via {}", path));
+                return Some("systemd-boot".to_string());
+            }
+        }
+    }
+    
+    // ============================================================================
+    // METHOD 4: Check for GRUB (most common bootloader)
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for GRUB configuration files");
+    
+    // Determine GRUB version through multiple methods
+    let mut grub_version = String::new();
+    
+    // Method 4a: Check GRUB binary version
+    if let Some(version_output) = run_cmd("grub-install", &["--version"])
+        .or_else(|| run_cmd("grub2-install", &["--version"]))
+        .or_else(|| run_cmd("grub-mkconfig", &["--version"])) {
+        
+        log_debug("BOOTLOADER", &format!("GRUB version check: {}", version_output.lines().next().unwrap_or("")));
+        
+        if version_output.contains("GRUB 2") || version_output.contains("(GRUB) 2") {
+            grub_version = "GRUB 2".to_string();
+        } else if version_output.contains("GRUB") {
+            grub_version = "GRUB".to_string();
+        }
+    }
+    
+    // Method 4b: Check config file for version
     let grub_paths = [
         "/boot/grub/grub.cfg",
         "/boot/grub2/grub.cfg",
@@ -1332,19 +1790,105 @@ fn get_bootloader() -> Option<String> {
         "/boot/efi/EFI/arch/grub.cfg",
         "/boot/efi/EFI/fedora/grub.cfg",
         "/boot/efi/EFI/debian/grub.cfg",
+        "/boot/efi/EFI/opensuse/grub.cfg",
+        "/boot/efi/EFI/centos/grub.cfg",
+        "/boot/efi/EFI/rhel/grub.cfg",
+        "/boot/efi/EFI/gentoo/grub.cfg",
+        "/boot/efi/EFI/manjaro/grub.cfg",
+        "/boot/efi/EFI/endeavouros/grub.cfg",
+        "/boot/efi/EFI/pop/grub.cfg",
+        "/boot/efi/EFI/garuda/grub.cfg",
+        "/boot/efi/EFI/zorin/grub.cfg",
+        "/boot/efi/EFI/mint/grub.cfg",
+        "/boot/efi/EFI/elementary/grub.cfg",
+        "/boot/efi/EFI/kali/grub.cfg",
+        "/boot/efi/EFI/parrot/grub.cfg",
+        "/boot/efi/EFI/solus/grub.cfg",
+        "/boot/efi/EFI/void/grub.cfg",
+        "/boot/efi/EFI/alpine/grub.cfg",
+        "/boot/efi/EFI/nixos/grub.cfg",
+        "/boot/efi/EFI/slackware/grub.cfg",
+        // Legacy BIOS locations
+        "/boot/grub/menu.lst",
+        "/boot/grub2/menu.lst",
+        "/boot/grub/grub.conf",
     ];
     
     for path in &grub_paths {
         if Path::new(path).exists() {
-            return Some("GRUB".to_string());
+            // Try to determine version from config file if not already known
+            if grub_version.is_empty() {
+                if path.contains("grub2") {
+                    grub_version = "GRUB 2".to_string();
+                } else if let Ok(content) = fs::read_to_string(path) {
+                    // Read first few lines to determine version
+                    let preview = content.lines().take(20).collect::<Vec<_>>().join("\n");
+                    if preview.contains("GRUB2") || preview.contains("grub2") || preview.contains("set root") {
+                        grub_version = "GRUB 2".to_string();
+                    } else if preview.contains("GRUB") {
+                        grub_version = "GRUB".to_string();
+                    }
+                }
+            }
+            
+            // If still unknown, default to GRUB 2 (most common nowadays)
+            if grub_version.is_empty() {
+                grub_version = "GRUB 2".to_string();
+            }
+            
+            log_info("BOOTLOADER", &format!("Detected {} via {}", grub_version, path));
+            return Some(grub_version);
         }
     }
     
-    if Path::new("/boot/efi/EFI/refind/refind.conf").exists() ||
-       Path::new("/efi/EFI/refind/refind.conf").exists() {
-        return Some("rEFInd".to_string());
+    // Method 4c: Check for GRUB in EFI directory (if config files not found)
+    let efi_grub_paths = [
+        "/boot/efi/EFI/grub/grubx64.efi",
+        "/boot/efi/EFI/GRUB/grubx64.efi",
+    ];
+    
+    for path in &efi_grub_paths {
+        if Path::new(path).exists() {
+            log_info("BOOTLOADER", &format!("Detected GRUB 2 via EFI binary: {}", path));
+            return Some("GRUB 2".to_string());
+        }
     }
     
+    // ============================================================================
+    // METHOD 5: Check for rEFInd
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for rEFInd configuration files");
+    let refind_paths = [
+        "/boot/efi/EFI/refind/refind.conf",
+        "/efi/EFI/refind/refind.conf",
+        "/boot/efi/EFI/BOOT/refind.conf",
+        "/boot/refind/refind.conf",
+        "/boot/efi/refind/refind.conf",
+        "/boot/efi/EFI/refind/refind_x64.efi",
+    ];
+    
+    for path in &refind_paths {
+        if Path::new(path).exists() {
+            // Try to get version if it's the config file
+            if path.ends_with("refind.conf") {
+                if let Ok(content) = fs::read_to_string(path) {
+                    for line in content.lines().take(30) {
+                        if line.contains("rEFInd") || line.contains("refind") {
+                            log_debug("BOOTLOADER", &format!("rEFInd config header: {}", line.trim()));
+                            break;
+                        }
+                    }
+                }
+            }
+            log_info("BOOTLOADER", &format!("Detected rEFInd via {}", path));
+            return Some("rEFInd".to_string());
+        }
+    }
+    
+    // ============================================================================
+    // METHOD 6: Check for Limine
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for Limine configuration files");
     let limine_paths = [
         "/boot/limine.cfg",
         "/boot/efi/limine.cfg",
@@ -1352,36 +1896,328 @@ fn get_bootloader() -> Option<String> {
         "/boot/limine/limine.cfg",
         "/boot/efi/EFI/limine/limine.cfg",
         "/boot/efi/EFI/BOOT/limine.cfg",
+        "/boot/efi/EFI/BOOT/BOOTX64.EFI",
+        "/boot/limine.sys",
     ];
     
     for path in &limine_paths {
         if Path::new(path).exists() {
-            return Some("Limine".to_string());
+            // For BOOTX64.EFI, verify it's actually Limine
+            if path.contains("BOOTX64.EFI") {
+                if let Ok(content) = fs::read(path) {
+                    let content_str = String::from_utf8_lossy(&content[..content.len().min(8192)]);
+                    if content_str.contains("Limine") || content_str.contains("limine") {
+                        log_info("BOOTLOADER", "Detected Limine via BOOTX64.EFI signature");
+                        return Some("Limine".to_string());
+                    }
+                }
+            } else {
+                log_info("BOOTLOADER", &format!("Detected Limine via {}", path));
+                return Some("Limine".to_string());
+            }
         }
     }
     
+    // ============================================================================
+    // METHOD 7: Check for Clover
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for Clover configuration files");
+    let clover_paths = [
+        "/boot/efi/EFI/CLOVER/config.plist",
+        "/efi/EFI/CLOVER/config.plist",
+        "/boot/efi/EFI/CLOVER/CLOVERX64.efi",
+    ];
+    
+    for path in &clover_paths {
+        if Path::new(path).exists() {
+            if path.contains("config.plist") {
+                log_info("BOOTLOADER", &format!("Detected Clover via {}", path));
+                return Some("Clover".to_string());
+            } else if path.contains("CLOVERX64.efi") {
+                log_info("BOOTLOADER", "Detected Clover via EFI binary");
+                return Some("Clover".to_string());
+            }
+        }
+    }
+    
+    // ============================================================================
+    // METHOD 8: Check for OpenCore
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for OpenCore configuration files");
+    let opencore_paths = [
+        "/boot/efi/EFI/OC/config.plist",
+        "/efi/EFI/OC/config.plist",
+        "/boot/efi/EFI/OC/OpenCore.efi",
+    ];
+    
+    for path in &opencore_paths {
+        if Path::new(path).exists() {
+            log_info("BOOTLOADER", &format!("Detected OpenCore via {}", path));
+            return Some("OpenCore".to_string());
+        }
+    }
+    
+    // ============================================================================
+    // METHOD 9: Check for LILO (Legacy)
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for LILO configuration");
     if Path::new("/etc/lilo.conf").exists() {
+        log_info("BOOTLOADER", "Detected LILO via /etc/lilo.conf");
         return Some("LILO".to_string());
     }
     
-    if Path::new("/boot/syslinux/syslinux.cfg").exists() {
-        return Some("Syslinux".to_string());
-    }
-
-    if let Some(output) = run_cmd("efibootmgr", &[]) {
-        let lower = output.to_lowercase();
-        if lower.contains("grub") {
-            return Some("GRUB".to_string());
-        } else if lower.contains("systemd") {
-            return Some("systemd-boot".to_string());
-        } else if lower.contains("refind") {
-            return Some("rEFInd".to_string());
-        } else if lower.contains("limine") {
-            return Some("Limine".to_string());
+    // ============================================================================
+    // METHOD 10: Check for Syslinux/ISOLINUX/EXTLINUX/PXELINUX
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for Syslinux variants");
+    let syslinux_paths = [
+        "/boot/syslinux/syslinux.cfg",
+        "/boot/extlinux/extlinux.conf",
+        "/boot/isolinux/isolinux.cfg",
+        "/extlinux.conf",
+        "/syslinux.cfg",
+        "/boot/syslinux.cfg",
+        "/boot/pxelinux.cfg/default",
+    ];
+    
+    for path in &syslinux_paths {
+        if Path::new(path).exists() {
+            let name = if path.contains("extlinux") {
+                "EXTLINUX"
+            } else if path.contains("isolinux") {
+                "ISOLINUX"
+            } else if path.contains("pxelinux") {
+                "PXELINUX"
+            } else {
+                "Syslinux"
+            };
+            log_info("BOOTLOADER", &format!("Detected {} via {}", name, path));
+            return Some(name.to_string());
         }
     }
     
-    None
+    // ============================================================================
+    // METHOD 11: Check for U-Boot (ARM devices, embedded systems)
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for U-Boot");
+    let uboot_paths = [
+        "/boot/u-boot.bin",
+        "/boot/boot.scr",
+        "/boot/uEnv.txt",
+        "/boot/uboot.env",
+        "/boot/extlinux/extlinux.conf",  // U-Boot can use extlinux
+    ];
+    
+    for path in &uboot_paths {
+        if Path::new(path).exists() {
+            log_info("BOOTLOADER", &format!("Detected U-Boot via {}", path));
+            return Some("U-Boot".to_string());
+        }
+    }
+    
+    // ============================================================================
+    // METHOD 12: Check for BURG (GRUB fork with themes)
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for BURG");
+    if Path::new("/boot/burg/burg.cfg").exists() {
+        log_info("BOOTLOADER", "Detected BURG via /boot/burg/burg.cfg");
+        return Some("BURG".to_string());
+    }
+    
+    // ============================================================================
+    // METHOD 13: Check for ELILO (EFI LILO)
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for ELILO");
+    if Path::new("/boot/efi/EFI/elilo/elilo.conf").exists() || 
+       Path::new("/etc/elilo.conf").exists() {
+        log_info("BOOTLOADER", "Detected ELILO");
+        return Some("ELILO".to_string());
+    }
+    
+    // ============================================================================
+    // METHOD 14: Check for GRUB4DOS (DOS/Windows GRUB)
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for GRUB4DOS");
+    if Path::new("/boot/grub4dos/menu.lst").exists() {
+        log_info("BOOTLOADER", "Detected GRUB4DOS");
+        return Some("GRUB4DOS".to_string());
+    }
+    
+    // ============================================================================
+    // METHOD 15: Check for Petitboot (PlayStation, PowerPC)
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for Petitboot");
+    if Path::new("/etc/petitboot").exists() {
+        log_info("BOOTLOADER", "Detected Petitboot");
+        return Some("Petitboot".to_string());
+    }
+    
+    // ============================================================================
+    // METHOD 16: Check for Raspberry Pi bootloader
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for Raspberry Pi bootloader");
+    if (Path::new("/boot/config.txt").exists() || Path::new("/boot/firmware/config.txt").exists()) && 
+       (Path::new("/boot/start.elf").exists() || Path::new("/boot/firmware/start.elf").exists()) {
+        log_info("BOOTLOADER", "Detected Raspberry Pi bootloader");
+        return Some("Raspberry Pi Bootloader".to_string());
+    }
+    
+    // ============================================================================
+    // METHOD 17: Check MBR/Boot Sector for Legacy BIOS systems
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking boot device MBR signature");
+    
+    // Try to find the boot device
+    if let Ok(mounts) = fs::read_to_string("/proc/mounts") {
+        for line in mounts.lines() {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 2 && (parts[1] == "/" || parts[1] == "/boot") {
+                let boot_device = parts[0];
+                // Extract base device (e.g., /dev/sda from /dev/sda1)
+                let base_device = boot_device
+                    .trim_end_matches(|c: char| c.is_ascii_digit())
+                    .trim_end_matches(|c: char| c == 'p');  // Handle /dev/nvme0n1p1
+                
+                log_debug("BOOTLOADER", &format!("Checking boot device: {}", base_device));
+                
+                // Read first 512 bytes of boot device (requires root, may fail)
+                if let Ok(mbr) = fs::read(base_device) {
+                    if mbr.len() >= 512 {
+                        let mbr_str = String::from_utf8_lossy(&mbr[0..512]);
+                        
+                        if mbr_str.contains("GRUB") {
+                            log_info("BOOTLOADER", "Detected GRUB from MBR signature");
+                            return Some("GRUB".to_string());
+                        } else if mbr_str.contains("LILO") {
+                            log_info("BOOTLOADER", "Detected LILO from MBR signature");
+                            return Some("LILO".to_string());
+                        } else if mbr_str.contains("SYSLINUX") {
+                            log_info("BOOTLOADER", "Detected Syslinux from MBR signature");
+                            return Some("Syslinux".to_string());
+                        } else if mbr_str.contains("ISOLINUX") {
+                            log_info("BOOTLOADER", "Detected ISOLINUX from MBR signature");
+                            return Some("ISOLINUX".to_string());
+                        }
+                    }
+                }
+                
+                if parts[1] == "/" {
+                    break;  // Found root, no need to continue
+                }
+            }
+        }
+    }
+    
+    // ============================================================================
+    // METHOD 18: Check kernel command line for bootloader hints
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking kernel command line for hints");
+    if let Ok(cmdline) = fs::read_to_string("/proc/cmdline") {
+        let lower = cmdline.to_lowercase();
+        
+        log_debug("BOOTLOADER", &format!("Kernel cmdline: {}", cmdline.chars().take(200).collect::<String>()));
+        
+        if lower.contains("grub") {
+            log_info("BOOTLOADER", "Detected GRUB from kernel command line");
+            return Some("GRUB".to_string());
+        } else if lower.contains("systemd-boot") || lower.contains("gummiboot") {
+            log_info("BOOTLOADER", "Detected systemd-boot from kernel command line");
+            return Some("systemd-boot".to_string());
+        } else if lower.contains("refind") {
+            log_info("BOOTLOADER", "Detected rEFInd from kernel command line");
+            return Some("rEFInd".to_string());
+        } else if lower.contains("bootloader=") {
+            // Some systems specify bootloader explicitly
+            for param in cmdline.split_whitespace() {
+                if param.starts_with("bootloader=") {
+                    let bl = param.split('=').nth(1).unwrap_or("").to_string();
+                    if !bl.is_empty() {
+                        log_info("BOOTLOADER", &format!("Detected {} from kernel parameter", bl));
+                        return Some(bl);
+                    }
+                }
+            }
+        }
+    }
+    
+    // ============================================================================
+    // METHOD 19: Check dmesg for bootloader messages
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking dmesg for bootloader hints");
+    if let Some(dmesg) = run_cmd("dmesg", &[]) {
+        let lower = dmesg.to_lowercase();
+        
+        if lower.contains("grub") && lower.contains("loading") {
+            log_info("BOOTLOADER", "Detected GRUB from dmesg");
+            return Some("GRUB".to_string());
+        } else if lower.contains("systemd-boot") {
+            log_info("BOOTLOADER", "Detected systemd-boot from dmesg");
+            return Some("systemd-boot".to_string());
+        }
+    }
+    
+    // ============================================================================
+    // METHOD 20: Check for UEFI firmware capsule updates (indicates UEFI boot)
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking UEFI firmware interface");
+    if Path::new("/sys/firmware/efi/efivars").exists() {
+        // System is UEFI but bootloader unknown
+        log_debug("BOOTLOADER", "UEFI system detected, checking EFI variables");
+        
+        // Try to read EFI variables for more info
+        if let Ok(entries) = fs::read_dir("/sys/firmware/efi/efivars") {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_lowercase();
+                if name.contains("bootloader") || name.contains("loader") {
+                    log_debug("BOOTLOADER", &format!("Found EFI variable: {}", name));
+                }
+            }
+        }
+    }
+    
+    // ============================================================================
+    // METHOD 21: Check for Coreboot/Libreboot
+    // ============================================================================
+    log_debug("BOOTLOADER", "Checking for Coreboot/Libreboot");
+    if let Ok(dmi_version) = fs::read_to_string("/sys/class/dmi/id/bios_version") {
+        let lower = dmi_version.to_lowercase();
+        if lower.contains("coreboot") {
+            log_info("BOOTLOADER", "Detected Coreboot firmware");
+            return Some("Coreboot".to_string());
+        } else if lower.contains("libreboot") {
+            log_info("BOOTLOADER", "Detected Libreboot firmware");
+            return Some("Libreboot".to_string());
+        }
+    }
+    
+    // ============================================================================
+    // METHOD 22: Final fallback - check if system is UEFI or BIOS
+    // ============================================================================
+    log_debug("BOOTLOADER", "Performing final UEFI/BIOS check");
+    if Path::new("/sys/firmware/efi").exists() {
+        log_warn("BOOTLOADER", "UEFI system detected but bootloader could not be identified");
+        
+        // Last attempt: check if there's ANY EFI file in the ESP
+        let efi_check_paths = [
+            "/boot/efi/EFI",
+            "/boot/EFI",
+            "/efi/EFI",
+        ];
+        
+        for esp_path in &efi_check_paths {
+            if let Ok(entries) = fs::read_dir(esp_path) {
+                let dirs: Vec<_> = entries.flatten().collect();
+                if !dirs.is_empty() {
+                    log_debug("BOOTLOADER", &format!("Found {} EFI directories in {}", dirs.len(), esp_path));
+                }
+            }
+        }
+        
+        return Some("Unknown (UEFI)".to_string());
+    } else {
+        log_warn("BOOTLOADER", "BIOS system detected but bootloader could not be identified");
+        return Some("Unknown (BIOS)".to_string());
+    }
 }
 
 fn get_packages() -> Option<String> {
@@ -1799,17 +2635,31 @@ fn get_entropy() -> Option<String> {
 }
 
 fn get_users_count() -> Option<usize> {
-    // Count entries with real login shells — zero subprocess spawns.
-    if let Ok(passwd) = fs::read_to_string("/etc/passwd") {
-        let count = passwd.lines().filter(|line| {
-            if line.is_empty() || line.starts_with('#') { return false; }
-            match line.rsplit(':').next() {
-                Some(shell) => shell != "/sbin/nologin" && shell != "/bin/false" && shell != "/usr/sbin/nologin",
-                None => false,
-            }
-        }).count();
-        if count > 0 { return Some(count); }
+    log_debug("USERS", "Counting currently logged-in users");
+    
+    // Try to read /var/run/utmp to count logged in users
+    // This is the most accurate method as it shows actual login sessions
+    if let Some(output) = run_cmd("who", &[]) {
+        let count = output.lines()
+            .filter(|line| !line.trim().is_empty())
+            .count();
+        if count > 0 {
+            log_debug("USERS", &format!("Found {} logged-in user(s) via 'who' command", count));
+            return Some(count);
+        }
     }
+    
+    // Fallback: try 'users' command which lists logged in users
+    if let Some(output) = run_cmd("users", &[]) {
+        let count = output.split_whitespace().count();
+        if count > 0 {
+            log_debug("USERS", &format!("Found {} logged-in user(s) via 'users' command", count));
+            return Some(count);
+        }
+    }
+    
+    // Last fallback: at least count ourselves as 1 logged-in user
+    log_debug("USERS", "Could not determine logged-in users, defaulting to 1 (current user)");
     Some(1)
 }
 
@@ -1849,21 +2699,53 @@ fn get_partitions_impl() -> Option<Vec<(String, String, f64, f64)>> {
 }
 
 fn run_cmd(cmd: &str, args: &[&str]) -> Option<String> {
-    Command::new(cmd)
-        .args(args)
-        .output()
-        .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+    let args_str = args.join(" ");
+    log_debug("COMMAND", &format!("Executing: {} {}", cmd, args_str));
+    
+    match Command::new(cmd).args(args).output() {
+        Ok(output) => {
+            if output.status.success() {
+                match String::from_utf8(output.stdout) {
+                    Ok(stdout) => {
+                        let result = stdout.trim().to_string();
+                        log_debug("COMMAND", &format!("Success: {} {} (output length: {} bytes)", 
+                            cmd, args_str, result.len()));
+                        Some(result)
+                    }
+                    Err(e) => {
+                        log_error("COMMAND", &format!("Failed to parse UTF-8 output from {} {}: {}", 
+                            cmd, args_str, e));
+                        None
+                    }
+                }
             } else {
+                let exit_code = output.status.code().unwrap_or(-1);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                log_warn("COMMAND", &format!("Command failed: {} {} (exit code: {}, stderr: {})", 
+                    cmd, args_str, exit_code, stderr.trim()));
                 None
             }
-        })
+        }
+        Err(e) => {
+            log_error("COMMAND", &format!("Failed to execute {} {}: {} (command may not be installed or available)", 
+                cmd, args_str, e));
+            None
+        }
+    }
 }
 
 fn read_file_trim(path: &str) -> Option<String> {
-    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    match fs::read_to_string(path) {
+        Ok(content) => {
+            let trimmed = content.trim().to_string();
+            log_debug("FILE", &format!("Successfully read {}: {} bytes", path, trimmed.len()));
+            Some(trimmed)
+        }
+        Err(e) => {
+            log_debug("FILE", &format!("Could not read {} (this is normal if file doesn't exist): {}", path, e));
+            None
+        }
+    }
 }
 
 fn get_model() -> Option<String> {
@@ -1991,11 +2873,6 @@ fn get_battery() -> Option<(u8, String)> {
     }
     
     None
-}
-
-fn get_network_final(net_start: Option<String>, delta: f64, should_ping: bool) -> Option<Vec<NetworkInfo>> {
-    let ip_out = run_cmd("ip", &["-o", "addr", "show"]);
-    get_network_final_with_ip(net_start, delta, should_ping, ip_out)
 }
 
 fn get_network_final_with_ip(net_start: Option<String>, delta: f64, should_ping: bool, ip_out: Option<String>) -> Option<Vec<NetworkInfo>> {
